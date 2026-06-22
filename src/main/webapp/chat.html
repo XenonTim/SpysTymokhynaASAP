@@ -1,0 +1,259 @@
+<div class="container">
+    <div class="ks-page-content">
+        <div class="ks-page-content-body">
+            <div class="ks-messenger">
+                <div class="ks-discussions">
+                    <div class="ks-search">
+                        <div class="input-icon icon-right icon icon-lg icon-color-primary">
+                            <input id="input-group-icon-text" type="text" class="form-control" placeholder="Search">
+                            <span class="icon-addon">
+                <span class="la la-search"></span>
+                        </span>
+                        </div>
+                    </div>
+                    <div class="ks-body ks-scrollable jspScrollable" data-auto-height="" style="height: 400px; overflow-y: auto; padding: 0px; width: 339px;" tabindex="0">
+
+                        <div class="jspContainer" style="width: 339px; height: 550px;">
+                            <div class="jspPane" style="padding: 0px; top: 0px; width: 329px;">
+                                <ul class="ks-items">
+                                    <c:forEach var="chat" items="${chatList}">
+                                        <li class="ks-item ${chat.id == activeChatId ? 'ks-active' : ''} ${chat.getUnreadCount(currentUser.id) > 0 ? 'ks-unread' : ''}">
+                                            <a href="messenger?chatId=${chat.id}">
+                                                <c:if var="unread" test="${chat.getUnreadCount(currentUser.id) > 0}">
+                                                    <span class="ks-group-amount">${chat.getUnreadCount(currentUser.id)}</span>
+                                                </c:if>
+
+                                                <div class="ks-body">
+                                                    <div class="ks-name">
+                                                        ${chat.name}
+                                                        <span class="ks-datetime">${chat.lastMessageTimeFormatted}</span>
+                                                    </div>
+                                                    <div class="ks-message">
+                                                        <c:out value="${chat.lastMessageText}" />
+                                                    </div>
+                                                </div>
+                                            </a>
+                                        </li>
+                                    </c:forEach>
+                                </ul>
+                            </div>
+                            <div class="jspVerticalBar">
+                                <div class="jspCap jspCapTop"></div>
+                                <div class="jspTrack" style="height: 550px;">
+                                    <div class="jspDrag" style="height: 261px;">
+                                        <div class="jspDragTop"></div>
+                                        <div class="jspDragBottom"></div>
+                                    </div>
+                                </div>
+                                <div class="jspCap jspCapBottom"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="ks-messages ks-messenger__messages">
+                    <div class="ks-header">
+                        <div class="ks-description">
+                            <div class="ks-name">${currentChat.name}</div>
+                            <div class="ks-amount">${currentChat.participantsCount} members</div>
+                        </div>
+                        <div class="ks-controls">
+                            <div class="dropdown">
+                                <button class="btn btn-primary-outline ks-light ks-no-text ks-no-arrow" type="button" id="dropdownMenuButton" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                    <span class="la la-ellipsis-h ks-icon"></span>
+                                </button>
+                                <div class="dropdown-menu dropdown-menu-right ks-simple" aria-labelledby="dropdownMenuButton">
+                                    <a class="dropdown-item" href="#">
+                                        <span class="la la-user-plus ks-icon"></span>
+                                        <span class="ks-text">Add members</span>
+                                    </a>
+                                    <a class="dropdown-item" href="#">
+                                        <span class="la la-eye-slash ks-icon"></span>
+                                        <span class="ks-text">Mark as unread</span>
+                                    </a>
+                                    <a class="dropdown-item" href="#">
+                                        <span class="la la-bell-slash-o ks-icon"></span>
+                                        <span class="ks-text">Mute notifications</span>
+                                    </a>
+                                    <a class="dropdown-item" href="#">
+                                        <span class="la la-mail-forward ks-icon"></span>
+                                        <span class="ks-text">Forward</span>
+                                    </a>
+                                    <a class="dropdown-item" href="#">
+                                        <span class="la la-ban ks-icon"></span>
+                                        <span class="ks-text">Spam</span>
+                                    </a>
+                                    <a class="dropdown-item" href="#">
+                                        <span class="la la-trash-o ks-icon"></span>
+                                        <span class="ks-text">Delete</span>
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="ks-body ks-scrollable jspScrollable" data-auto-height="" data-reduce-height=".ks-footer" data-fix-height="32" style="height: 480px; overflow: hidden; padding: 0px; width: 701px;" tabindex="0">
+                        <div class="jspContainer" style="width: 701px; height: 481px;">
+                            <div class="jspPane" style="padding: 0px; top: 0px; width: 691px;">
+                                <ul class="ks-items">
+                                    <c:forEach var="msg" items="${messageList}">
+                                        <li class="ks-item ${msg.senderId == currentUser.id ? 'ks-self' : 'ks-from'}">
+            <span class="ks-avatar">
+                <img src="${msg.senderAvatarUrl}" width="36" height="36" class="rounded-circle">
+            </span>
+                                            <div class="ks-body">
+                                                <div class="ks-header">
+                                                    <span class="ks-name">${msg.senderName}</span>
+                                                    <span class="ks-datetime">${msg.timeFormatted}</span>
+                                                </div>
+                                                <div class="ks-message">
+                                                    <c:out value="${msg.text}" />
+                                                </div>
+                                            </div>
+                                        </li>
+                                    </c:forEach>
+                                </ul>
+                            </div>
+                            <div class="jspVerticalBar">
+                                <div class="jspCap jspCapTop"></div>
+                                <div class="jspTrack" style="height: 481px;">
+                                    <div class="jspDrag" style="height: 206px;">
+                                        <div class="jspDragTop"></div>
+                                        <div class="jspDragBottom"></div>
+                                    </div>
+                                </div>
+                                <div class="jspCap jspCapBottom"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="ks-footer">
+                        <textarea class="form-control" placeholder="Type something..."></textarea>
+                        <div class="ks-controls">
+                            <button class="btn btn-primary">Send</button>
+                            <a href="#" class="la la-paperclip ks-attachment"></a>
+                            <div class="dropdown dropup">
+                                <button class="btn btn-link ks-smile" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                    <span class="la la-smile-o"></span>
+                                </button>
+                                <div class="dropdown-menu dropdown-menu-right ks-scrollable ks-smileys" aria-labelledby="dropdownMenuButton" style="overflow: hidden; padding: 0px; width: 200px;">
+
+                                    <div class="jspContainer" style="width: 198px; height: 165px;">
+                                        <div class="jspPane" style="padding: 0px; top: 0px; left: 0px; width: 100px;">
+                                            <div class="ks-smileys-wrapper">
+                                                <table>
+                                                    <tbody>
+                                                    <tr>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar2.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar3.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar4.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar2.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar3.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar4.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar5.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar6.png" width="20" height="20">
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar7.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar2.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar3.png" width="20" height="20">
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar2.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar3.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar4.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar5.png" width="20" height="20">
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar2.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar3.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar4.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar5.png" width="20" height="20">
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar1.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar2.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar3.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar4.png" width="20" height="20">
+                                                        </td>
+                                                        <td>
+                                                            <img src="https://bootdey.com/img/Content/avatar/avatar5.png" width="20" height="20">
+                                                        </td>
+                                                    </tr>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
