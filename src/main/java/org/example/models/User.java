@@ -1,32 +1,42 @@
 package org.example.models;
 
-import org.bson.types.ObjectId;
-
 public class User {
-    private ObjectId id;
-    private String username;
-    private String email;
-    private String passwordHash;
-    private boolean isOnline;
 
-    public User(ObjectId id, String username, String email, String passwordHash, boolean isOnline) {
-        this.id = id;
-        this.username = username;
-        this.email = email;
+    public enum Role { USER, ADMIN }
+    public enum Status { ACTIVE, BANNED }
+
+    private String id;
+    private String login;
+    private String passwordHash;
+    private Role role;
+    private Status status;
+    private boolean online;
+
+    public User() {}
+
+    public User(String login, String passwordHash, Role role) {
+        this.login = login;
         this.passwordHash = passwordHash;
-        this.isOnline = isOnline;
+        this.role = role;
+        this.status = Status.ACTIVE;
+        this.online = false;
     }
 
-    public ObjectId getId() { return id; }
-    public String getUsername() { return username; }
-    public String getEmail() { return email; }
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+
+    public String getLogin() { return login; }
+    public void setLogin(String login) { this.login = login; }
+
     public String getPasswordHash() { return passwordHash; }
-    public boolean getIsOnline() { return isOnline; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
 
-    public ObjectId setId(ObjectId id) { this.id = id; return id; }
-    public String setUsername(String username) { this.username = username; return username; }
-    public String setEmail(String email) { this.email = email; return email; }
-    public String setPasswordHash(String passwordHash) {this.passwordHash = passwordHash; return passwordHash; }
-    public boolean setIsOnline(boolean isOnline) { this.isOnline = isOnline; return isOnline; }
+    public Role getRole() { return role; }
+    public void setRole(Role role) { this.role = role; }
+
+    public Status getStatus() { return status; }
+    public void setStatus(Status status) { this.status = status; }
+
+    public boolean isOnline() { return online; }
+    public void setOnline(boolean online) { this.online = online; }
 }
-
