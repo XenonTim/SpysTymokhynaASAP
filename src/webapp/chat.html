@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ASAP — Чат</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="me" id="me-name">—<span class="role-badge" id="role-badge" style="display:none;">ADMIN</span></div>
+        <div class="status-line"><span class="status-dot" id="status-dot"></span><span id="status-text">З'єднання...</span></div>
+      </div>
+
+      <div class="new-chat-row">
+        <input type="text" id="new-chat-login" placeholder="Логін користувача">
+        <select id="new-chat-type">
+          <option value="PRIVATE">Приватний</option>
+          <option value="GROUP">Груповий</option>
+        </select>
+        <button id="new-chat-btn">+</button>
+      </div>
+
+      <ul class="chat-list" id="chat-list"></ul>
+
+      <div class="admin-panel" id="admin-panel" style="display:none;">
+        <h3>Адмін-панель</h3>
+        <div class="admin-row">
+          <input type="text" id="ban-login" placeholder="Логін для бану">
+          <button id="ban-btn">Бан</button>
+        </div>
+        <button class="admin-stats-btn" id="stats-btn">Статистика серверу</button>
+      </div>
+    </aside>
+
+    <main class="main-pane">
+      <div class="main-header" id="main-header">
+        <span class="placeholder-text">Оберіть чат зліва або створіть новий</span>
+      </div>
+
+      <div class="empty-state" id="empty-state">
+        У вас ще немає відкритого чату. Введіть логін контакту вище, щоб почати спілкування.
+      </div>
+
+      <div class="messages-pane" id="messages-pane" style="display:none;"></div>
+
+      <div class="composer" id="composer" style="display:none;">
+        <input type="text" id="message-input" placeholder="Напишіть повідомлення..." autocomplete="off">
+        <button id="send-btn">Надіслати</button>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="/asap-client.js"></script>
+  <script>
+    const myLogin = sessionStorage.getItem("asap_login");
+    const myRole = sessionStorage.getItem("asap_role") || "USER";
+
+    if (!myLogin) {
+      window.location.href = "/login.html";
+    }
+
+    document.getElementById("me-name").textContent = myLogin;
+    if (myRole === "ADMIN") {
+      document.getElementById("role-badge").style.display = "inline-block";
+      document.getElementById("admin-panel").style.display = "block";
+    }
+
+    let chats = [];
+    let activeChatId = null;
+    let messagesByChat = {};
+    const onlineUsers = new Set();
+
+    // Дуже простий XOR-шифр "наскрізного" типу для демонстрації шифрування
+    // повідомлень у транзиті (вимога ТЗ п.2 — шифрування змісту повідомлень).
+    // Реальний AES уже застосовується на боці сервера між Server і ClientHandler
+    // (org.example.shared.security.AesUtil) для сесійного шифрування; цей шар
+    // додатково обфускує вміст, який бачить WebGateway/мережа браузера.
+    const CHAT_KEY = "asap-demo-key";
+    function xorCipher(text, key) {
+      let result = "";
+      for (let i = 0; i < text.length; i++) {
+        result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+      }
+      return result;
+    }
+    function encryptForWire(text) {
+      return btoa(unescape(encodeURIComponent(xorCipher(text, CHAT_KEY))));
+    }
+    function decryptFromWire(payload) {
+      try {
+        return xorCipher(decodeURIComponent(escape(atob(payload))), CHAT_KEY);
+      } catch (e) {
+        return "[не вдалося розшифрувати]";
+      }
+    }
+
+    function showToast(text) {
+      const toast = document.getElementById("toast");
+      toast.textContent = text;
+      toast.classList.add("show");
+      setTimeout(() => toast.classList.remove("show"), 2500);
+    }
+
+    function setStatus(online) {
+      document.getElementById("status-dot").classList.toggle("online", online);
+      document.getElementById("status-text").textContent = online ? "Онлайн" : "Офлайн";
+    }
+
+    function renderChatList() {
+      const list = document.getElementById("chat-list");
+      list.innerHTML = "";
+      chats.forEach((chat) => {
+        const li = document.createElement("li");
+        li.className = "chat-list-item" + (chat.id === activeChatId ? " active" : "");
+        li.innerHTML = `${escapeHtml(chat.name)} <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>`;
+        li.addEventListener("click", () => openChat(chat.id));
+        list.appendChild(li);
+      });
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement("div");
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function openChat(chatId) {
+      activeChatId = chatId;
+      renderChatList();
+
+      const chat = chats.find((c) => c.id === chatId);
+      document.getElementById("main-header").textContent = chat ? chat.name : "";
+      document.getElementById("empty-state").style.display = "none";
+      document.getElementById("messages-pane").style.display = "flex";
+      document.getElementById("composer").style.display = "flex";
+
+      if (!messagesByChat[chatId]) {
+        ASAPClient.send("GET_HISTORY", { chatId });
+      } else {
+        renderMessages(chatId);
+      }
+    }
+
+    function renderMessages(chatId) {
+      const pane = document.getElementById("messages-pane");
+      pane.innerHTML = "";
+      (messagesByChat[chatId] || []).forEach((msg) => {
+        const bubble = document.createElement("div");
+        bubble.className = "msg-bubble " + (msg.sender === myLogin ? "mine" : "theirs");
+        const time = msg.sentAt ? new Date(Number(msg.sentAt)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+        bubble.innerHTML = `<div class="meta">${escapeHtml(msg.sender)} · ${time}</div><div>${escapeHtml(msg.text)}</div>`;
+        pane.appendChild(bubble);
+      });
+      pane.scrollTop = pane.scrollHeight;
+    }
+
+    function addLiveMessage(chatId, sender, text, sentAt) {
+      if (!messagesByChat[chatId]) messagesByChat[chatId] = [];
+      messagesByChat[chatId].push({ sender, text, sentAt: sentAt || Date.now() });
+      if (chatId === activeChatId) renderMessages(chatId);
+    }
+
+    function parseHistory(jsonArrayString) {
+      try {
+        return JSON.parse(jsonArrayString);
+      } catch (e) {
+        return [];
+      }
+    }
+
+    ASAPClient.onOpen(() => {
+      setStatus(true);
+      ASAPClient.send("GET_CONTACTS", {});
+    });
+
+    ASAPClient.onClose(() => {
+      setStatus(false);
+      showToast("З'єднання з сервером втрачено");
+    });
+
+    ASAPClient.onMessage((data) => {
+      switch (data.type) {
+        case "CONTACTS_RESPONSE": {
+          chats = JSON.parse(data.chats || "[]");
+          renderChatList();
+          break;
+        }
+        case "CHAT_CREATED": {
+          ASAPClient.send("GET_CONTACTS", {});
+          openChat(data.chatId);
+          break;
+        }
+        case "HISTORY_RESPONSE": {
+          const raw = parseHistory(data.messages || "[]");
+          messagesByChat[data.chatId] = raw.map((m) => ({
+            sender: m.sender,
+            text: decryptFromWire(m.content),
+            sentAt: m.sentAt
+          }));
+          if (data.chatId === activeChatId) renderMessages(data.chatId);
+          break;
+        }
+        case "SEND_MSG": {
+          addLiveMessage(data.chatId, data.sender, decryptFromWire(data.content), Date.now());
+          break;
+        }
+        case "MSG_DELIVERED": {
+          break;
+        }
+        case "USER_STATUS_UPDATE": {
+          if (data.online === "true") onlineUsers.add(data.login);
+          else onlineUsers.delete(data.login);
+          break;
+        }
+        case "ADMIN_ACTION_RESULT": {
+          if (data.result === "stats") {
+            showToast(`Активних з'єднань: ${data.connections}`);
+          } else {
+            showToast(data.result);
+          }
+          break;
+        }
+        case "LOGIN_FAIL": {
+          showToast(data.reason || "Сесію завершено");
+          sessionStorage.clear();
+          window.location.href = "/login.html";
+          break;
+        }
+        case "ERROR": {
+          showToast(data.reason || "Помилка");
+          break;
+        }
+      }
+    });
+
+    document.getElementById("new-chat-btn").addEventListener("click", () => {
+      const otherLogin = document.getElementById("new-chat-login").value.trim();
+      const type = document.getElementById("new-chat-type").value;
+      if (!otherLogin) return;
+
+      ASAPClient.send("CREATE_CHAT", {
+        type,
+        name: type === "GROUP" ? `Група: ${myLogin}, ${otherLogin}` : `Чат з ${otherLogin}`,
+        members: `${myLogin},${otherLogin}`
+      });
+      document.getElementById("new-chat-login").value = "";
+    });
+
+    document.getElementById("send-btn").addEventListener("click", sendCurrentMessage);
+    document.getElementById("message-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendCurrentMessage();
+    });
+
+    function sendCurrentMessage() {
+      const input = document.getElementById("message-input");
+      const text = input.value.trim();
+      if (!text || !activeChatId) return;
+
+      ASAPClient.send("SEND_MSG", {
+        chatId: activeChatId,
+        content: encryptForWire(text)
+      });
+      addLiveMessage(activeChatId, myLogin, text, Date.now());
+      input.value = "";
+    }
+
+    document.getElementById("ban-btn").addEventListener("click", () => {
+      const target = document.getElementById("ban-login").value.trim();
+      if (!target) return;
+      ASAPClient.send("ADMIN_ACTION", { action: "BAN_USER", target });
+      document.getElementById("ban-login").value = "";
+    });
+
+    document.getElementById("stats-btn").addEventListener("click", () => {
+      ASAPClient.send("ADMIN_ACTION", { action: "SERVER_STATS", target: "" });
+    });
+
+    ASAPClient.connect().catch(() => {
+      showToast("Не вдалося з'єднатися з WebGateway");
+    });
+  </script>
+</body>
+</html>

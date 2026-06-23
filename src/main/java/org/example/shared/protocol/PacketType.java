@@ -1,0 +1,32 @@
+package org.example.shared.protocol;
+
+public enum PacketType {
+    REGISTER_REQUEST,
+    REGISTER_SUCCESS,
+    REGISTER_FAIL,
+
+    LOGIN_REQUEST,
+    LOGIN_SUCCESS,
+    LOGIN_FAIL,
+
+    SEND_MSG,
+    MSG_DELIVERED,
+
+    GET_HISTORY,
+    HISTORY_RESPONSE,
+
+    GET_CONTACTS,
+    CONTACTS_RESPONSE,
+
+    CREATE_CHAT,
+    CHAT_CREATED,
+
+    USER_STATUS_UPDATE,
+
+    ADMIN_ACTION,
+    ADMIN_ACTION_RESULT,
+
+    ERROR,
+    PING,
+    PONG
+}
