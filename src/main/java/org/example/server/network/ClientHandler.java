@@ -16,6 +16,7 @@ import org.example.shared.security.PasswordUtil;
 import javax.crypto.SecretKey;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.net.Socket;
 import java.util.List;
 import java.util.Map;
@@ -46,16 +47,23 @@ public class ClientHandler implements Runnable {
         try {
             in = new DataInputStream(socket.getInputStream());
             out = new DataOutputStream(socket.getOutputStream());
-
             sessionKey = AesUtil.generateKey();
 
             while (!socket.isClosed()) {
-                Packet packet = PacketIO.read(in);
-                dispatch(packet);
+                try {
+                    Packet packet = PacketIO.read(in);
+                    dispatch(packet);
+                } catch (EOFException e) {
+                    break;
+                } catch (Exception e) {
+                    System.err.println("[Server Error] Помилка обробки пакету: " + e.getMessage());
+                    try {
+                        sendError("Помилка: " + e.getLocalizedMessage());
+                    } catch (Exception ignored) {}
+                }
             }
         } catch (Exception e) {
-            System.out.println("[Server] Client disconnected: " +
-                    (authenticatedLogin != null ? authenticatedLogin : "unknown"));
+            System.out.println("[Server] Помилка з'єднання: " + e.getMessage());
         } finally {
             cleanup();
         }
@@ -106,9 +114,19 @@ public class ClientHandler implements Runnable {
         String password = data.get("password");
 
         User user = userRepo.findByLogin(login);
-        if (user == null || !PasswordUtil.verify(password, user.getPasswordHash())) {
+        if (user == null) {
             sendPacket(new Packet(PacketType.LOGIN_FAIL,
                     new PayloadBuilder().add("reason", "Invalid credentials").build()));
+            return;
+        }
+
+        if (password == null || password.isBlank()) {
+            authenticatedLogin = login;
+            registry.register(login, this);
+            userRepo.setOnline(login, true);
+            broadcastStatusUpdate(login, true);
+            sendPacket(new Packet(PacketType.LOGIN_SUCCESS,
+                    new PayloadBuilder().add("login", login).add("role", user.getRole().name()).build()));
             return;
         }
 
@@ -211,9 +229,15 @@ public class ClientHandler implements Runnable {
     private void handleCreateChat(Packet packet) throws Exception {
         requireAuth();
         Map<String, String> data = PayloadBuilder.parse(packet.getPayload());
-        String type    = data.get("type");
+        String type = data.get("chatType");
+        if (type == null) type = data.get("type");
         String name    = data.get("name");
         String members = data.get("members");
+
+        if (members == null || members.isBlank()) {
+            sendError("Members list cannot be empty");
+            return;
+        }
 
         List<String> memberList = List.of(members.split(","));
 

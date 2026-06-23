@@ -29,6 +29,9 @@ public class PayloadBuilder {
     public static Map<String, String> parse(byte[] payload) {
         String json = new String(payload, StandardCharsets.UTF_8).trim();
         Map<String, String> map = new HashMap<>();
+        if (payload == null || payload.length == 0) {
+            return map;
+        }
         json = json.replaceAll("^\\{|\\}$", "");
         for (String pair : json.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")) {
             String[] kv = pair.split("\":\"", 2);
