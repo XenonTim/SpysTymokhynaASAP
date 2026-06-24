@@ -138,7 +138,7 @@ body {
   border-radius: var(--radius);
   box-shadow: 0 20px 50px rgba(20, 14, 50, 0.25);
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: minmax(320px, 320px) 1fr;
   overflow: hidden;
 }
 
@@ -296,6 +296,9 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 .main-header {
@@ -313,6 +316,8 @@ body {
 .messages-pane {
   flex: 1;
   overflow-y: auto;
+  min-height: 0;
+  max-height: calc(100% - 130px);
   padding: 18px 22px;
   display: flex;
   flex-direction: column;
