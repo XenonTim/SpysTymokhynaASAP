@@ -244,13 +244,12 @@ public class ClientHandler implements Runnable {
             typeStr = data.get("type");
         }
 
-        if (typeStr == null || typeStr.isBlank()) {
-            typeStr = "PRIVATE";
+        Chat.Type chatType = Chat.Type.PRIVATE;
+        if (typeStr != null && "GROUP".equalsIgnoreCase(typeStr.trim())) {
+            chatType = Chat.Type.GROUP;
         }
 
-        typeStr = typeStr.trim().toUpperCase();
-
-        String name    = data.get("name");
+        String name = data.get("name");
         String members = data.get("members");
 
         if (members == null || members.isBlank()) {
@@ -258,9 +257,15 @@ public class ClientHandler implements Runnable {
             return;
         }
 
+        if (name != null) {
+            name = name.replace(",", "_");
+        } else {
+            name = "Chat_" + System.currentTimeMillis();
+        }
+
         List<String> memberList = List.of(members.split(","));
 
-        if ("PRIVATE".equals(typeStr) && memberList.size() == 2) {
+        if (chatType == Chat.Type.PRIVATE && memberList.size() == 2) {
             Chat existing = chatRepo.findPrivateChat(memberList.get(0), memberList.get(1));
             if (existing != null) {
                 sendPacket(new Packet(PacketType.CHAT_CREATED,
@@ -269,7 +274,7 @@ public class ClientHandler implements Runnable {
             }
         }
 
-        Chat chat = new Chat(Chat.Type.valueOf(typeStr), name, memberList);
+        Chat chat = new Chat(chatType, name, memberList);
         chatRepo.save(chat);
 
         sendPacket(new Packet(PacketType.CHAT_CREATED,

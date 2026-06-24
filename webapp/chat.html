@@ -222,7 +222,8 @@
       switch (data.type) {
         case "LOGIN_SUCCESS": {
           ASAPClient.send("GET_CONTACTS", {});
-          break; }
+          break;
+        }
         case "PONG": {
           break;
         }
@@ -323,20 +324,19 @@
 
       const getUsername = (email) => {
         if (!email || typeof email !== 'string') return "user";
-        return email.split("@");
+        return email.split("@")[0];
       };
 
       let chatName = "";
       if (type === "GROUP") {
         chatName = `Group_${membersList.map(e => getUsername(e)).join("_")}`;
       } else {
-        const targetUser = cleanedLogins;
+        const targetUser = cleanedLogins[0];
         const pair = [myLogin, targetUser].sort().map(e => getUsername(e));
-        chatName = `${pair}_${pair}`;
+        chatName = `${pair}`;
       }
 
       ASAPClient.send("CREATE_CHAT", {
-        type: type,
         chatType: type,
         name: chatName,
         members: membersList.join(",")
