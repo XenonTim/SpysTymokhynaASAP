@@ -43,4 +43,8 @@ public class SessionRegistry {
             }
         });
     }
+
+    public Set<String> getAllOnlineLogins() {
+        return onlineLogins;
+    }
 }

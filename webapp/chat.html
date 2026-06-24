@@ -117,23 +117,49 @@
     function renderChatList() {
       const list = document.getElementById("chat-list");
       list.innerHTML = "";
+
       chats.forEach((chat) => {
         const li = document.createElement("li");
         li.className = "chat-list-item" + (chat.id === activeChatId ? " active" : "");
 
-        let cleanName = chat.name.replaceAll("_", ", ");
+        let cleanName = chat.name ? chat.name : "Чат";
+        let isOnline = false;
 
-        if (chat.type === "PRIVATE" || !chat.type) {
-          const myUsername = myLogin.split("@");
-          const parts = chat.name.split("_");
-          if (parts.length === 2) {
-            cleanName = parts === myUsername ? parts : parts;
+        if (chat.type === "GROUP") {
+          if (chat.name && chat.name.startsWith("Group_")) {
+            cleanName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
+          } else {
+            cleanName = "Група: " + cleanName;
           }
-        } else if (chat.name.startsWith("Group_")) {
-          cleanName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
+        } else {
+          if (chat.memberLogins) {
+            const members = typeof chat.memberLogins === 'string' ? chat.memberLogins.split(";") : chat.memberLogins;
+
+            const partnerEmail = members.find(m => m.trim().toLowerCase() !== myLogin.toLowerCase());
+
+            if (partnerEmail) {
+              const cleanPartner = partnerEmail.trim();
+              cleanName = cleanPartner.split("@")[0];
+
+              isOnline = onlineUsers.has(cleanPartner);
+            }
+          }
         }
 
-        li.innerHTML = `${escapeHtml(cleanName)} <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>`;
+        let dotHtml = "";
+        if (chat.type !== "GROUP") {
+          const statusClass = isOnline ? "user-status-dot online" : "user-status-dot offline";
+          dotHtml = `<span class="${statusClass}"></span>`;
+        }
+
+        li.innerHTML = `
+          <div class="chat-item-title" style="display: flex; align-items: center; gap: 8px;">
+            ${dotHtml}
+            <span>${escapeHtml(cleanName)}</span>
+          </div>
+          <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>
+        `;
+
         li.addEventListener("click", () => openChat(chat.id));
         list.appendChild(li);
       });
@@ -150,16 +176,18 @@
       renderChatList();
 
       const chat = chats.find((c) => c.id === chatId);
+      let displayName = chat ? chat.name : "";
 
-      let displayName = chat ? chat.name.replaceAll("_", ", ") : "";
-      if (chat && (chat.type === "PRIVATE" || !chat.type)) {
-        const myUsername = myLogin.split("@");
-        const parts = chat.name.split("_");
-        if (parts.length === 2) {
-          displayName = parts === myUsername ? parts : parts;
+      if (chat) {
+        if (chat.type === "GROUP") {
+          displayName = chat.name.startsWith("Group_") ? "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ") : chat.name;
+        } else {
+          if (chat.memberLogins) {
+            const members = typeof chat.memberLogins === 'string' ? chat.memberLogins.split(";") : chat.memberLogins;
+            const partnerEmail = members.find(m => m.trim().toLowerCase() !== myLogin.toLowerCase());
+            if (partnerEmail) displayName = partnerEmail.trim().split("@")[0];
+          }
         }
-      } else if (chat && chat.name.startsWith("Group_")) {
-        displayName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
       }
 
       document.getElementById("main-header").textContent = displayName;
@@ -298,15 +326,21 @@
           break;
         }
         case "SEND_MSG": {
-          addLiveMessage(data.chatId, data.sender, decryptFromWire(data.content), Date.now());
+          addLiveMessage(data.chatId, data.sender, decryptFromWire(data.content), Date.now(), data.messageId);
           break;
         }
         case "MSG_DELIVERED": {
           break;
         }
         case "USER_STATUS_UPDATE": {
-          if (data.online === "true") onlineUsers.add(data.login);
-          else onlineUsers.delete(data.login);
+          console.log("=== ОНОВЛЕННЯ СТАТУСУ ===", data);
+          if (data.online === "true") {
+            onlineUsers.add(data.login);
+          } else {
+            onlineUsers.delete(data.login);
+          }
+          console.log("Поточний Set онлайн-користувачів:", Array.from(onlineUsers));
+          renderChatList();
           break;
         }
         case "ADMIN_ACTION_RESULT": {

@@ -142,6 +142,19 @@ public class ClientHandler implements Runnable {
 
         broadcastStatusUpdate(login, true);
 
+        for (String onlineUser : registry.getAllOnlineLogins()) {
+            if (!onlineUser.equals(login)) {
+                Packet existingUserPacket = new Packet(PacketType.USER_STATUS_UPDATE,
+                        new PayloadBuilder()
+                                .add("login", onlineUser)
+                                .add("online", "true")
+                                .build());
+                try {
+                    this.sendPacket(existingUserPacket);
+                } catch (Exception ignored) {}
+            }
+        }
+
         sendPacket(new Packet(PacketType.LOGIN_SUCCESS,
                 new PayloadBuilder()
                         .add("login", login)
@@ -226,6 +239,12 @@ public class ClientHandler implements Runnable {
             item.put("id", c.getId());
             item.put("name", c.getName());
             item.put("type", c.getType().name());
+
+            if (c.getMemberLogins() != null) {
+                item.put("memberLogins", String.join(";", c.getMemberLogins()));
+            } else {
+                item.put("memberLogins", "");
+            }
 
             sb.append(org.example.gateway.SimpleJson.toJson(item));
         }
@@ -374,7 +393,7 @@ public class ClientHandler implements Runnable {
                         .add("login", login)
                         .add("online", String.valueOf(online))
                         .build());
-        registry.broadcast(statusPacket, login);
+        registry.broadcast(statusPacket, "");
     }
 
     public synchronized void sendPacket(Packet packet) throws Exception {
