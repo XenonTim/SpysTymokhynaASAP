@@ -195,10 +195,14 @@ public class ClientHandler implements Runnable {
         for (int i = 0; i < messages.size(); i++) {
             Message m = messages.get(i);
             if (i > 0) sb.append(",");
-            sb.append("{\"id\":\"").append(m.getId()).append("\"")
-              .append(",\"sender\":\"").append(m.getSenderLogin()).append("\"")
-              .append(",\"content\":\"").append(m.getEncryptedContent()).append("\"")
-              .append(",\"sentAt\":\"").append(m.getSentAt().toEpochMilli()).append("\"}");
+
+            Map<String, String> item = new java.util.LinkedHashMap<>();
+            item.put("id", m.getId());
+            item.put("sender", m.getSenderLogin());
+            item.put("content", m.getEncryptedContent());
+            item.put("sentAt", String.valueOf(m.getSentAt().toEpochMilli()));
+
+            sb.append(org.example.gateway.SimpleJson.toJson(item));
         }
         sb.append("]");
 
@@ -212,13 +216,18 @@ public class ClientHandler implements Runnable {
     private void handleGetContacts(Packet packet) throws Exception {
         requireAuth();
         List<Chat> chats = chatRepo.findByMember(authenticatedLogin);
+
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < chats.size(); i++) {
             Chat c = chats.get(i);
             if (i > 0) sb.append(",");
-            sb.append("{\"id\":\"").append(c.getId()).append("\"")
-              .append(",\"name\":\"").append(c.getName()).append("\"")
-              .append(",\"type\":\"").append(c.getType().name()).append("\"}");
+
+            Map<String, String> item = new java.util.LinkedHashMap<>();
+            item.put("id", c.getId());
+            item.put("name", c.getName());
+            item.put("type", c.getType().name());
+
+            sb.append(org.example.gateway.SimpleJson.toJson(item));
         }
         sb.append("]");
 
@@ -229,8 +238,18 @@ public class ClientHandler implements Runnable {
     private void handleCreateChat(Packet packet) throws Exception {
         requireAuth();
         Map<String, String> data = PayloadBuilder.parse(packet.getPayload());
-        String type = data.get("chatType");
-        if (type == null) type = data.get("type");
+
+        String typeStr = data.get("chatType");
+        if (typeStr == null || typeStr.isBlank()) {
+            typeStr = data.get("type");
+        }
+
+        if (typeStr == null || typeStr.isBlank()) {
+            typeStr = "PRIVATE";
+        }
+
+        typeStr = typeStr.trim().toUpperCase();
+
         String name    = data.get("name");
         String members = data.get("members");
 
@@ -241,7 +260,7 @@ public class ClientHandler implements Runnable {
 
         List<String> memberList = List.of(members.split(","));
 
-        if (Chat.Type.PRIVATE.name().equals(type) && memberList.size() == 2) {
+        if ("PRIVATE".equals(typeStr) && memberList.size() == 2) {
             Chat existing = chatRepo.findPrivateChat(memberList.get(0), memberList.get(1));
             if (existing != null) {
                 sendPacket(new Packet(PacketType.CHAT_CREATED,
@@ -250,7 +269,7 @@ public class ClientHandler implements Runnable {
             }
         }
 
-        Chat chat = new Chat(Chat.Type.valueOf(type), name, memberList);
+        Chat chat = new Chat(Chat.Type.valueOf(typeStr), name, memberList);
         chatRepo.save(chat);
 
         sendPacket(new Packet(PacketType.CHAT_CREATED,

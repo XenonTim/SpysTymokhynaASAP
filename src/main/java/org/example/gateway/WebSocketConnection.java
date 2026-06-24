@@ -124,11 +124,11 @@ public class WebSocketConnection {
         long len = b2 & 0x7F;
 
         if (len == 126) {
-            len = (readByte() << 8) | readByte();
+            len = ((readByte() & 0xFF) << 8) | (readByte() & 0xFF);
         } else if (len == 127) {
             len = 0;
             for (int i = 0; i < 8; i++) {
-                len = (len << 8) | readByte();
+                len = (len << 8) | (readByte() & 0xFF);
             }
         }
 
@@ -146,8 +146,6 @@ public class WebSocketConnection {
             }
         }
 
-        // Цей проєкт не збирає фрагментовані фрейми (fin=false) — для коротких
-        // JSON-повідомлень чату це не потрібно, тож fin тут навмисно не перевіряється.
         Frame frame = new Frame();
         frame.opcode = opcode;
         frame.payload = payload;

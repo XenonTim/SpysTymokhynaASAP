@@ -74,9 +74,9 @@
 
     let chats = [];
     let activeChatId = null;
+    let pendingChatIdToOpen = null;
     let messagesByChat = {};
     const onlineUsers = new Set();
-    let pendingChatIdToOpen = null;
 
     // Дуже простий XOR-шифр "наскрізного" типу для демонстрації шифрування
     // повідомлень у транзиті (вимога ТЗ п.2 — шифрування змісту повідомлень).
@@ -120,7 +120,20 @@
       chats.forEach((chat) => {
         const li = document.createElement("li");
         li.className = "chat-list-item" + (chat.id === activeChatId ? " active" : "");
-        li.innerHTML = `${escapeHtml(chat.name)} <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>`;
+
+        let cleanName = chat.name.replaceAll("_", ", ");
+
+        if (chat.type === "PRIVATE" || !chat.type) {
+          const myUsername = myLogin.split("@");
+          const parts = chat.name.split("_");
+          if (parts.length === 2) {
+            cleanName = parts === myUsername ? parts : parts;
+          }
+        } else if (chat.name.startsWith("Group_")) {
+          cleanName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
+        }
+
+        li.innerHTML = `${escapeHtml(cleanName)} <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>`;
         li.addEventListener("click", () => openChat(chat.id));
         list.appendChild(li);
       });
@@ -137,7 +150,19 @@
       renderChatList();
 
       const chat = chats.find((c) => c.id === chatId);
-      document.getElementById("main-header").textContent = chat ? chat.name : "";
+
+      let displayName = chat ? chat.name.replaceAll("_", ", ") : "";
+      if (chat && (chat.type === "PRIVATE" || !chat.type)) {
+        const myUsername = myLogin.split("@");
+        const parts = chat.name.split("_");
+        if (parts.length === 2) {
+          displayName = parts === myUsername ? parts : parts;
+        }
+      } else if (chat && chat.name.startsWith("Group_")) {
+        displayName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
+      }
+
+      document.getElementById("main-header").textContent = displayName;
       document.getElementById("empty-state").style.display = "none";
       document.getElementById("messages-pane").style.display = "flex";
       document.getElementById("composer").style.display = "flex";
@@ -202,11 +227,16 @@
           break;
         }
         case "CONTACTS_RESPONSE": {
-          chats = JSON.parse(data.chats || "[]");
-          renderChatList();
-          if (pendingChatIdToOpen) {
-            openChat(pendingChatIdToOpen);
-            pendingChatIdToOpen = null;
+          try {
+            chats = JSON.parse(data.chats || "[]");
+            renderChatList();
+
+            if (pendingChatIdToOpen) {
+              openChat(pendingChatIdToOpen);
+              pendingChatIdToOpen = null;
+            }
+          } catch (jsonError) {
+            console.error("Помилка парсингу контактів:", jsonError);
           }
           break;
         }
@@ -216,13 +246,28 @@
           break;
         }
         case "HISTORY_RESPONSE": {
-          const raw = parseHistory(data.messages || "[]");
-          messagesByChat[data.chatId] = raw.map((m) => ({
-            sender: m.sender,
-            text: decryptFromWire(m.content),
-            sentAt: m.sentAt
-          }));
-          if (data.chatId === activeChatId) renderMessages(data.chatId);
+          try {
+            const raw = parseHistory(data.messages || "[]");
+            messagesByChat[data.chatId] = raw.map((m) => {
+              let textToShow = m.content;
+              try {
+                textToShow = decryptFromWire(m.content);
+              } catch (e) {
+                console.warn("Помилка розшифрування:", e);
+              }
+              return {
+                sender: m.sender,
+                text: textToShow,
+                sentAt: m.sentAt
+              };
+            });
+
+            if (data.chatId === activeChatId) {
+              renderMessages(data.chatId);
+            }
+          } catch (err) {
+            console.error("Помилка парсингу історії:", err);
+          }
           break;
         }
         case "SEND_MSG": {
@@ -259,15 +304,44 @@
     });
 
     document.getElementById("new-chat-btn").addEventListener("click", () => {
-      const otherLogin = document.getElementById("new-chat-login").value.trim();
+      const rawLogins = document.getElementById("new-chat-login").value.trim();
       const type = document.getElementById("new-chat-type").value;
-      if (!otherLogin) return;
+      if (!rawLogins) return;
+
+      const cleanedLogins = rawLogins.split(",")
+              .map(l => l.trim())
+              .filter(l => l.length > 0);
+
+      if (cleanedLogins.length === 0) return;
+
+      let membersList = [myLogin];
+      cleanedLogins.forEach(login => {
+        if (!membersList.includes(login)) {
+          membersList.push(login);
+        }
+      });
+
+      const getUsername = (email) => {
+        if (!email || typeof email !== 'string') return "user";
+        return email.split("@");
+      };
+
+      let chatName = "";
+      if (type === "GROUP") {
+        chatName = `Group_${membersList.map(e => getUsername(e)).join("_")}`;
+      } else {
+        const targetUser = cleanedLogins;
+        const pair = [myLogin, targetUser].sort().map(e => getUsername(e));
+        chatName = `${pair}_${pair}`;
+      }
 
       ASAPClient.send("CREATE_CHAT", {
+        type: type,
         chatType: type,
-        name: type === "GROUP" ? `Група: ${myLogin}, ${otherLogin}` : `Чат з ${otherLogin}`,
-        members: `${myLogin},${otherLogin}`
+        name: chatName,
+        members: membersList.join(",")
       });
+
       document.getElementById("new-chat-login").value = "";
     });
 
