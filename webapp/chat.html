@@ -212,9 +212,9 @@
       pane.scrollTop = pane.scrollHeight;
     }
 
-    function addLiveMessage(chatId, sender, text, sentAt) {
+    function addLiveMessage(chatId, sender, text, sentAt, messageId) {
       if (!messagesByChat[chatId]) messagesByChat[chatId] = [];
-      messagesByChat[chatId].push({ sender, text, sentAt: sentAt || Date.now() });
+      messagesByChat[chatId].push({ id: messageId, sender, text, sentAt: sentAt || Date.now() });
       if (chatId === activeChatId) renderMessages(chatId);
     }
 
@@ -282,6 +282,7 @@
                 console.warn("Помилка розшифрування:", e);
               }
               return {
+                id: m.id,
                 sender: m.sender,
                 text: textToShow,
                 sentAt: m.sentAt
@@ -311,7 +312,11 @@
         case "ADMIN_ACTION_RESULT": {
           if (data.result === "stats") {
             showToast(`Активних з'єднань: ${data.connections}`);
-          } else {
+          } else if (data.result === "REFRESH_HISTORY") {
+            if (data.chatId === activeChatId) {
+              ASAPClient.send("GET_HISTORY", {chatId: activeChatId});
+            }
+          }else {
             showToast(data.result);
           }
           break;
