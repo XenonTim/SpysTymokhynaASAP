@@ -3,7 +3,6 @@ package org.example.db;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
-import static com.mongodb.client.model.Updates.pull;
 import org.bson.Document;
 import org.example.models.Chat;
 
@@ -51,23 +50,6 @@ public class ChatRepository {
                 ))
                 .map(this::docToChat)
                 .first();
-    }
-
-    public void removeMemberFromAllChats(String username) {
-        collection.updateMany(
-                new Document(),
-                pull("memberLogins", username)
-        );
-    }
-
-    public String createNewChat(String chatName, List<String> participants, Chat.Type type) {
-        Document newChat = new Document()
-                .append("type", type.name())
-                .append("name", chatName)
-                .append("memberLogins", participants)
-                .append("createdAt", System.currentTimeMillis());
-        collection.insertOne(newChat);
-        return newChat.getObjectId("_id").toHexString();
     }
 
     private Chat docToChat(Document doc) {

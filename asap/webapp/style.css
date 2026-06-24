@@ -128,8 +128,6 @@ body {
   color: var(--ink-soft);
 }
 
-/* ---- Chat layout ---- */
-
 .app-shell {
   width: 100%;
   max-width: 980px;
@@ -138,7 +136,7 @@ body {
   border-radius: var(--radius);
   box-shadow: 0 20px 50px rgba(20, 14, 50, 0.25);
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: minmax(320px, 320px) 1fr;
   overflow: hidden;
 }
 
@@ -296,6 +294,9 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 .main-header {
@@ -313,6 +314,8 @@ body {
 .messages-pane {
   flex: 1;
   overflow-y: auto;
+  min-height: 0;
+  max-height: calc(100% - 130px);
   padding: 18px 22px;
   display: flex;
   flex-direction: column;
@@ -401,6 +404,29 @@ body {
 }
 
 .toast.show { opacity: 1; }
+
+.chat-item-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.user-status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.user-status-dot.online {
+  background-color: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+
+.user-status-dot.offline {
+  background-color: #b9b6c4;
+}
 
 @media (max-width: 720px) {
   .app-shell {

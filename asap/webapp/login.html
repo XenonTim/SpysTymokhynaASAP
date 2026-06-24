@@ -31,6 +31,7 @@
   </div>
 
   <script src="/asap-client.js"></script>
+  <script src="/crypto.js"></script>
   <script>
     const form = document.getElementById("login-form");
     const submitBtn = document.getElementById("submit-btn");
@@ -45,6 +46,7 @@
       if (data.type === "LOGIN_SUCCESS") {
         sessionStorage.setItem("asap_login", data.login);
         sessionStorage.setItem("asap_role", data.role || "USER");
+        sessionStorage.setItem("asap_session_token", data.sessionToken || "");
         window.location.href = "/chat.html";
       } else if (data.type === "LOGIN_FAIL") {
         submitBtn.disabled = false;
@@ -67,8 +69,11 @@
       const password = document.getElementById("password").value;
 
       try {
+
+        const publicKey = await ASAPCrypto.loadOrCreateIdentity(login);
+
         await ASAPClient.connect();
-        ASAPClient.send("LOGIN_REQUEST", { login, password });
+        ASAPClient.send("LOGIN_REQUEST", { login, password, publicKey });
       } catch (err) {
         submitBtn.disabled = false;
         showMessage("Не вдалося з'єднатися з сервером. Перевірте, чи запущено WebGateway.", "error");

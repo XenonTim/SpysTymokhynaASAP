@@ -31,12 +31,14 @@
   </div>
 
   <script src="/asap-client.js"></script>
+  <script src="/crypto.js"></script>
   <script>
     const form = document.getElementById("register-form");
     const submitBtn = document.getElementById("submit-btn");
     const messageBox = document.getElementById("message");
     let pendingLogin = null;
     let pendingPassword = null;
+    let pendingPublicKey = null;
 
     function showMessage(text, kind) {
       messageBox.textContent = text;
@@ -46,13 +48,14 @@
     ASAPClient.onMessage((data) => {
       if (data.type === "REGISTER_SUCCESS") {
         showMessage("Акаунт створено! Виконую вхід...", "success");
-        ASAPClient.send("LOGIN_REQUEST", { login: pendingLogin, password: pendingPassword });
+        ASAPClient.send("LOGIN_REQUEST", { login: pendingLogin, password: pendingPassword, publicKey: pendingPublicKey });
       } else if (data.type === "REGISTER_FAIL") {
         submitBtn.disabled = false;
         showMessage(data.reason || "Не вдалося зареєструватися", "error");
       } else if (data.type === "LOGIN_SUCCESS") {
         sessionStorage.setItem("asap_login", data.login);
         sessionStorage.setItem("asap_role", data.role || "USER");
+        sessionStorage.setItem("asap_session_token", data.sessionToken || "");
         window.location.href = "/chat.html";
       } else if (data.type === "LOGIN_FAIL" || data.type === "ERROR") {
         submitBtn.disabled = false;
@@ -72,8 +75,11 @@
       pendingPassword = document.getElementById("password").value;
 
       try {
+
+        pendingPublicKey = await ASAPCrypto.loadOrCreateIdentity(pendingLogin);
+
         await ASAPClient.connect();
-        ASAPClient.send("REGISTER_REQUEST", { login: pendingLogin, password: pendingPassword });
+        ASAPClient.send("REGISTER_REQUEST", { login: pendingLogin, password: pendingPassword, publicKey: pendingPublicKey });
       } catch (err) {
         submitBtn.disabled = false;
         showMessage("Не вдалося з'єднатися з сервером. Перевірте, чи запущено WebGateway.", "error");

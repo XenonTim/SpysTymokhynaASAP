@@ -3,14 +3,6 @@ package org.example.gateway;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/**
- * Дуже простий JSON-кодек для плоских об'єктів {"key":"value", ...}.
- *
- * Навмисно не використовує жодної зовнішньої бібліотеки — браузерний клієнт
- * і так працює лише з плоскими полями (login, password, chatId, content...),
- * тож повноцінний JSON-парсер тут надлишковий. Формат сумісний з тим, який
- * вже генерує org.example.shared.protocol.PayloadBuilder на боці сервера.
- */
 public class SimpleJson {
 
     public static Map<String, String> parse(String json) {

@@ -5,71 +5,73 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.Updates;
 import org.bson.Document;
-import org.example.models.Role;
+import org.bson.types.ObjectId;
 import org.example.models.User;
-import org.example.models.UserStatus;
 
 public class UserRepository {
 
     private final MongoCollection<Document> collection;
 
-    // Правильний конструктор, який підключається до вашої бази
     public UserRepository() {
         MongoDatabase db = MongoDBConnection.getDatabase();
         this.collection = db.getCollection("users");
     }
 
-    // --- ВАШІ БАЗОВІ МЕТОДИ ---
-
-    public boolean exists(String login) {
+    public boolean existsByLogin(String login) {
         return collection.find(Filters.eq("login", login)).first() != null;
     }
 
     public void save(User user) {
-        Document doc = new Document("login", user.getLogin())
+        Document doc = new Document()
+                .append("login", user.getLogin())
                 .append("passwordHash", user.getPasswordHash())
                 .append("role", user.getRole().name())
-                .append("status", user.getStatus() != null ? user.getStatus().name() : UserStatus.ACTIVE.name())
-                .append("isOnline", false);
+                .append("status", user.getStatus().name())
+                .append("online", false)
+                .append("publicKey", user.getPublicKey());
         collection.insertOne(doc);
+        user.setId(doc.getObjectId("_id").toHexString());
     }
 
     public User findByLogin(String login) {
         Document doc = collection.find(Filters.eq("login", login)).first();
-        if (doc == null) return null;
-
-        User user = new User(
-                doc.getString("login"),
-                doc.getString("passwordHash"),
-                Role.valueOf(doc.getString("role"))
-        );
-
-        if (doc.containsKey("status")) {
-            user.setStatus(UserStatus.valueOf(doc.getString("status")));
-        }
-        return user;
+        return doc != null ? docToUser(doc) : null;
     }
 
-    // --- НОВІ МЕТОДИ ЗГІДНО З ТЗ ---
-
-    // Переведення статусу користувача в OFFLINE/ONLINE у БД
-    public void updateOnlineStatus(String login, boolean isOnline) {
+    public void setOnline(String login, boolean online) {
         collection.updateOne(
                 Filters.eq("login", login),
-                Updates.set("isOnline", isOnline)
+                Updates.set("online", online)
         );
     }
 
-    // Оновлення статусу користувача (наприклад, для бану)
-    public void updateStatus(String login, UserStatus status) {
+    public void setStatus(String login, User.Status status) {
         collection.updateOne(
                 Filters.eq("login", login),
                 Updates.set("status", status.name())
         );
     }
 
-    // Повне видалення користувача з бази (для команди адміна DELETE_USER)
-    public void deleteByLogin(String login) {
+    public void setPublicKey(String login, String publicKey) {
+        collection.updateOne(
+                Filters.eq("login", login),
+                Updates.set("publicKey", publicKey)
+        );
+    }
+
+    public void delete(String login) {
         collection.deleteOne(Filters.eq("login", login));
+    }
+
+    private User docToUser(Document doc) {
+        User user = new User();
+        user.setId(doc.getObjectId("_id").toHexString());
+        user.setLogin(doc.getString("login"));
+        user.setPasswordHash(doc.getString("passwordHash"));
+        user.setRole(User.Role.valueOf(doc.getString("role")));
+        user.setStatus(User.Status.valueOf(doc.getString("status")));
+        user.setOnline(Boolean.TRUE.equals(doc.getBoolean("online")));
+        user.setPublicKey(doc.getString("publicKey"));
+        return user;
     }
 }

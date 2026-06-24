@@ -1,7 +1,3 @@
-// asap-client.js
-// Тонка обгортка над WebSocket для спілкування з WebGateway.
-// Кожне повідомлення — плоский JSON-об'єкт з полем "type", що відповідає
-// org.example.shared.protocol.PacketType на сервері.
 
 const ASAPClient = (() => {
   let socket = null;

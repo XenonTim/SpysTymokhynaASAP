@@ -7,17 +7,6 @@ import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.function.Consumer;
 
-/**
- * Мінімальна реалізація сервера WebSocket (RFC 6455) "з нуля",
- * без зовнішніх бібліотек — достатньо для обміну текстовими (JSON) фреймами
- * між браузером і WebGateway.
- *
- * Підтримує лише те, що потрібно цьому проєкту:
- *  - один HTTP Upgrade handshake;
- *  - текстові фрейми (opcode 0x1) від клієнта до сервера (завжди маскуються браузером);
- *  - текстові фрейми від сервера до клієнта (без маски);
- *  - close-фрейм (opcode 0x8) для коректного завершення з'єднання.
- */
 public class WebSocketConnection {
 
     private static final String WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -32,10 +21,6 @@ public class WebSocketConnection {
         this.out = out;
     }
 
-    /**
-     * Виконує WebSocket handshake над уже прийнятим HTTP GET запитом.
-     * requestHeaders — заголовки, які вже зчитав HTTP-шар (потрібен лише Sec-WebSocket-Key).
-     */
     public static WebSocketConnection upgrade(Socket socket, String secWebSocketKey) throws IOException {
         OutputStream out = socket.getOutputStream();
         String acceptKey = computeAcceptKey(secWebSocketKey);
@@ -61,7 +46,6 @@ public class WebSocketConnection {
         }
     }
 
-    /** Блокуюче читання фреймів у циклі. Кличе onText для кожного текстового повідомлення. */
     public void listen(Consumer<String> onText, Runnable onClose) {
         try {
             while (true) {
@@ -77,7 +61,7 @@ public class WebSocketConnection {
                 }
             }
         } catch (IOException ignored) {
-            // з'єднання закрито клієнтом
+
         } finally {
             onClose.run();
             closeQuietly();

@@ -1,61 +1,46 @@
 package org.example.models;
 
 public class User {
+
+    public enum Role { USER, ADMIN }
+    public enum Status { ACTIVE, BANNED }
+
     private String id;
     private String login;
     private String passwordHash;
     private Role role;
-    private UserStatus status;
+    private Status status;
+    private boolean online;
+    private String publicKey;
 
-    // Порожній конструктор
-    public User() {
-    }
+    public User() {}
 
-    // Конструктор з 3 параметрами (який використовується в UserRepository та ClientHandler)
     public User(String login, String passwordHash, Role role) {
         this.login = login;
         this.passwordHash = passwordHash;
         this.role = role;
-        this.status = UserStatus.ACTIVE; // За замовчуванням користувач активний
+        this.status = Status.ACTIVE;
+        this.online = false;
     }
 
-    public String getLogin() {
-        return login;
-    }
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
 
-    public void setLogin(String login) {
-        this.login = login;
-    }
+    public String getLogin() { return login; }
+    public void setLogin(String login) { this.login = login; }
 
-    public String getPasswordHash() {
-        return passwordHash;
-    }
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
 
-    public void setPasswordHash(String passwordHash) {
-        this.passwordHash = passwordHash;
-    }
+    public Role getRole() { return role; }
+    public void setRole(Role role) { this.role = role; }
 
-    public Role getRole() {
-        return role;
-    }
+    public Status getStatus() { return status; }
+    public void setStatus(Status status) { this.status = status; }
 
-    public void setRole(Role role) {
-        this.role = role;
-    }
+    public boolean getIsOnline() { return online; }
+    public void setOnline(boolean online) { this.online = online; }
 
-    public UserStatus getStatus() {
-        return status;
-    }
-
-    public void setStatus(UserStatus status) {
-        this.status = status;
-    }
-
-    public String getId() {
-        return id;
-    }
-
-    public void setId(String id) {
-        this.id = id;
-    }
+    public String getPublicKey() { return publicKey; }
+    public void setPublicKey(String publicKey) { this.publicKey = publicKey; }
 }

@@ -7,16 +7,6 @@ import org.example.shared.protocol.PayloadBuilder;
 
 import java.util.Map;
 
-/**
- * Місток "один браузерний клієнт ↔ одне TCP-з'єднання до ASAP Server".
- *
- * Кожне нове WebSocket-з'єднання від браузера створює власний
- * ServerConnection (так само, як це робить консольний TestClient) і
- * відкриває окреме TCP-з'єднання до org.example.server.network.Server.
- * Це навмисне рішення: gateway нічого не підмінює у протоколі — він лише
- * перекладає JSON (зручний для JS) у бінарні Packet/PacketType, якими вже
- * оперує сервер, і навпаки.
- */
 public class ClientSessionBridge {
 
     private final WebSocketConnection ws;

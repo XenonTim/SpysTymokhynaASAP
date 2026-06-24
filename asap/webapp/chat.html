@@ -56,11 +56,13 @@
   <div class="toast" id="toast"></div>
 
   <script src="/asap-client.js"></script>
+  <script src="/crypto.js"></script>
   <script>
     const myLogin = sessionStorage.getItem("asap_login");
     const myRole = sessionStorage.getItem("asap_role") || "USER";
+    let mySessionToken = sessionStorage.getItem("asap_session_token");
 
-    if (!myLogin) {
+    if (!myLogin || !mySessionToken) {
       window.location.href = "/login.html";
     }
 
@@ -77,28 +79,62 @@
     let pendingChatIdToOpen = null;
     let messagesByChat = {};
     const onlineUsers = new Set();
+    const chatPeers = {};
+    const pendingDecrypt = {};
 
-    // Дуже простий XOR-шифр "наскрізного" типу для демонстрації шифрування
-    // повідомлень у транзиті (вимога ТЗ п.2 — шифрування змісту повідомлень).
-    // Реальний AES уже застосовується на боці сервера між Server і ClientHandler
-    // (org.example.shared.security.AesUtil) для сесійного шифрування; цей шар
-    // додатково обфускує вміст, який бачить WebGateway/мережа браузера.
-    const CHAT_KEY = "asap-demo-key";
-    function xorCipher(text, key) {
-      let result = "";
-      for (let i = 0; i < text.length; i++) {
-        result += String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+    async function ensureChatKey(chatId) {
+      if (await ASAPCrypto.hasChatKey(chatId)) return true;
+
+      const peers = chatPeers[chatId] || [];
+      if (peers.length === 0) return false;
+
+      const allMembers = [myLogin, ...peers].slice().sort();
+      const iAmInitiator = allMembers[0] === myLogin;
+
+      if (!iAmInitiator) {
+
+        pendingDecrypt[chatId] = true;
+        ASAPClient.send("REQUEST_KEY_EXCHANGE", { chatId });
+        return false;
       }
-      return result;
+
+      await ASAPCrypto.generateChatKey(chatId);
+      for (const peerLogin of peers) {
+        await sendKeyToPeer(chatId, peerLogin);
+      }
+      return true;
     }
-    function encryptForWire(text) {
-      return btoa(unescape(encodeURIComponent(xorCipher(text, CHAT_KEY))));
+
+    async function sendKeyToPeer(chatId, peerLogin) {
+      const publicKey = await fetchPeerPublicKey(peerLogin);
+      if (!publicKey) {
+        console.warn("Немає публічного ключа для", peerLogin, "— ключ чату надішлю пізніше");
+        return;
+      }
+      const encryptedKey = await ASAPCrypto.wrapChatKeyForPeer(chatId, publicKey);
+      ASAPClient.send("KEY_EXCHANGE", { chatId, recipient: peerLogin, encryptedKey });
     }
-    function decryptFromWire(payload) {
+
+    const publicKeyRequests = {};
+    function fetchPeerPublicKey(login) {
+      if (publicKeyRequests[login]) return publicKeyRequests[login];
+      publicKeyRequests[login] = new Promise((resolve) => {
+        publicKeyWaiters[login] = publicKeyWaiters[login] || [];
+        publicKeyWaiters[login].push(resolve);
+        ASAPClient.send("GET_PUBLIC_KEY", { login });
+      });
+      return publicKeyRequests[login];
+    }
+    const publicKeyWaiters = {};
+
+    async function encryptForWire(chatId, text) {
+      return ASAPCrypto.encryptMessage(chatId, text);
+    }
+    async function decryptFromWire(chatId, payload) {
       try {
-        return xorCipher(decodeURIComponent(escape(atob(payload))), CHAT_KEY);
+        return await ASAPCrypto.decryptMessage(chatId, payload);
       } catch (e) {
-        return "[не вдалося розшифрувати]";
+        return "[не вдалося розшифрувати: немає ключа цього чату на цьому пристрої]";
       }
     }
 
@@ -117,23 +153,55 @@
     function renderChatList() {
       const list = document.getElementById("chat-list");
       list.innerHTML = "";
+
       chats.forEach((chat) => {
+
+        if (chat.memberLogins) {
+          const members = typeof chat.memberLogins === 'string' ? chat.memberLogins.split(";") : chat.memberLogins;
+          chatPeers[chat.id] = members.map(m => m.trim()).filter(m => m && m.toLowerCase() !== myLogin.toLowerCase());
+        }
+
         const li = document.createElement("li");
         li.className = "chat-list-item" + (chat.id === activeChatId ? " active" : "");
 
-        let cleanName = chat.name.replaceAll("_", ", ");
+        let cleanName = chat.name ? chat.name : "Чат";
+        let isOnline = false;
 
-        if (chat.type === "PRIVATE" || !chat.type) {
-          const myUsername = myLogin.split("@");
-          const parts = chat.name.split("_");
-          if (parts.length === 2) {
-            cleanName = parts === myUsername ? parts : parts;
+        if (chat.type === "GROUP") {
+          if (chat.name && chat.name.startsWith("Group_")) {
+            cleanName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
+          } else {
+            cleanName = "Група: " + cleanName;
           }
-        } else if (chat.name.startsWith("Group_")) {
-          cleanName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
+        } else {
+          if (chat.memberLogins) {
+            const members = typeof chat.memberLogins === 'string' ? chat.memberLogins.split(";") : chat.memberLogins;
+
+            const partnerEmail = members.find(m => m.trim().toLowerCase() !== myLogin.toLowerCase());
+
+            if (partnerEmail) {
+              const cleanPartner = partnerEmail.trim();
+              cleanName = cleanPartner.split("@")[0];
+
+              isOnline = onlineUsers.has(cleanPartner);
+            }
+          }
         }
 
-        li.innerHTML = `${escapeHtml(cleanName)} <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>`;
+        let dotHtml = "";
+        if (chat.type !== "GROUP") {
+          const statusClass = isOnline ? "user-status-dot online" : "user-status-dot offline";
+          dotHtml = `<span class="${statusClass}"></span>`;
+        }
+
+        li.innerHTML = `
+          <div class="chat-item-title" style="display: flex; align-items: center; gap: 8px;">
+            ${dotHtml}
+            <span>${escapeHtml(cleanName)}</span>
+          </div>
+          <span class="chat-type">(${chat.type === "GROUP" ? "група" : "приватний"})</span>
+        `;
+
         li.addEventListener("click", () => openChat(chat.id));
         list.appendChild(li);
       });
@@ -145,27 +213,31 @@
       return div.innerHTML;
     }
 
-    function openChat(chatId) {
+    async function openChat(chatId) {
       activeChatId = chatId;
       renderChatList();
 
       const chat = chats.find((c) => c.id === chatId);
+      let displayName = chat ? chat.name : "";
 
-      let displayName = chat ? chat.name.replaceAll("_", ", ") : "";
-      if (chat && (chat.type === "PRIVATE" || !chat.type)) {
-        const myUsername = myLogin.split("@");
-        const parts = chat.name.split("_");
-        if (parts.length === 2) {
-          displayName = parts === myUsername ? parts : parts;
+      if (chat) {
+        if (chat.type === "GROUP") {
+          displayName = chat.name.startsWith("Group_") ? "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ") : chat.name;
+        } else {
+          if (chat.memberLogins) {
+            const members = typeof chat.memberLogins === 'string' ? chat.memberLogins.split(";") : chat.memberLogins;
+            const partnerEmail = members.find(m => m.trim().toLowerCase() !== myLogin.toLowerCase());
+            if (partnerEmail) displayName = partnerEmail.trim().split("@")[0];
+          }
         }
-      } else if (chat && chat.name.startsWith("Group_")) {
-        displayName = "Група: " + chat.name.replace("Group_", "").replaceAll("_", ", ");
       }
 
       document.getElementById("main-header").textContent = displayName;
       document.getElementById("empty-state").style.display = "none";
       document.getElementById("messages-pane").style.display = "flex";
       document.getElementById("composer").style.display = "flex";
+
+      await ensureChatKey(chatId);
 
       if (!messagesByChat[chatId]) {
         ASAPClient.send("GET_HISTORY", { chatId });
@@ -212,9 +284,9 @@
       pane.scrollTop = pane.scrollHeight;
     }
 
-    function addLiveMessage(chatId, sender, text, sentAt) {
+    function addLiveMessage(chatId, sender, text, sentAt, messageId) {
       if (!messagesByChat[chatId]) messagesByChat[chatId] = [];
-      messagesByChat[chatId].push({ sender, text, sentAt: sentAt || Date.now() });
+      messagesByChat[chatId].push({ id: messageId, sender, text, sentAt: sentAt || Date.now() });
       if (chatId === activeChatId) renderMessages(chatId);
     }
 
@@ -226,10 +298,12 @@
       }
     }
 
-    ASAPClient.onOpen(() => {
+    ASAPClient.onOpen(async () => {
       setStatus(true);
       console.log("З'єднання встановлено. Ініціалізація сесії для:", myLogin);
-      ASAPClient.send("LOGIN_REQUEST", { login: myLogin });
+
+      const publicKey = await ASAPCrypto.loadOrCreateIdentity(myLogin);
+      ASAPClient.send("LOGIN_REQUEST", { login: myLogin, sessionToken: mySessionToken, publicKey });
 
       setInterval(() => {
         if (document.getElementById("status-dot").classList.contains("online")) {
@@ -246,6 +320,10 @@
     ASAPClient.onMessage((data) => {
       switch (data.type) {
         case "LOGIN_SUCCESS": {
+          if (data.sessionToken) {
+            mySessionToken = data.sessionToken;
+            sessionStorage.setItem("asap_session_token", mySessionToken);
+          }
           ASAPClient.send("GET_CONTACTS", {});
           break;
         }
@@ -267,51 +345,116 @@
           break;
         }
         case "CHAT_CREATED": {
+
+          if (data.memberLogins) {
+            const members = data.memberLogins.split(";").map(m => m.trim());
+            chatPeers[data.chatId] = members.filter(m => m && m.toLowerCase() !== myLogin.toLowerCase());
+          }
           pendingChatIdToOpen = data.chatId;
           ASAPClient.send("GET_CONTACTS", {});
           break;
         }
-        case "HISTORY_RESPONSE": {
-          try {
-            const raw = parseHistory(data.messages || "[]");
-            messagesByChat[data.chatId] = raw.map((m) => {
-              let textToShow = m.content;
-              try {
-                textToShow = decryptFromWire(m.content);
-              } catch (e) {
-                console.warn("Помилка розшифрування:", e);
-              }
-              return {
-                sender: m.sender,
-                text: textToShow,
-                sentAt: m.sentAt
-              };
-            });
+        case "PUBLIC_KEY_RESPONSE": {
+          (async () => {
+            const waiters = publicKeyWaiters[data.login] || [];
+            delete publicKeyWaiters[data.login];
+            const key = await ASAPCrypto.importPeerPublicKey(data.login, data.publicKey);
+            waiters.forEach((resolve) => resolve(key));
+          })();
+          break;
+        }
+        case "REQUEST_KEY_EXCHANGE": {
 
-            if (data.chatId === activeChatId) {
-              renderMessages(data.chatId);
+          (async () => {
+            if ((await ASAPCrypto.hasChatKey(data.chatId)) && data.requester) {
+              await sendKeyToPeer(data.chatId, data.requester);
             }
-          } catch (err) {
-            console.error("Помилка парсингу історії:", err);
-          }
+          })();
+          break;
+        }
+        case "KEY_EXCHANGE": {
+
+          (async () => {
+            try {
+              await ASAPCrypto.unwrapChatKey(data.chatId, data.encryptedKey);
+              delete pendingDecrypt[data.chatId];
+              if (data.chatId === activeChatId) {
+                ASAPClient.send("GET_HISTORY", { chatId: activeChatId });
+              }
+            } catch (e) {
+              console.error("Не вдалося розшифрувати AES-ключ чату:", e);
+            }
+          })();
+          break;
+        }
+        case "HISTORY_RESPONSE": {
+          (async () => {
+            try {
+              const raw = parseHistory(data.messages || "[]");
+              await ensureChatKey(data.chatId);
+              messagesByChat[data.chatId] = await Promise.all(raw.map(async (m) => {
+                let textToShow;
+                try {
+                  textToShow = await decryptFromWire(data.chatId, m.content);
+                } catch (e) {
+                  textToShow = "[не вдалося розшифрувати]";
+                }
+                return {
+                  id: m.id,
+                  sender: m.sender,
+                  text: textToShow,
+                  sentAt: m.sentAt
+                };
+              }));
+
+              if (data.chatId === activeChatId) {
+                renderMessages(data.chatId);
+              }
+            } catch (err) {
+              console.error("Помилка парсингу історії:", err);
+            }
+          })();
           break;
         }
         case "SEND_MSG": {
-          addLiveMessage(data.chatId, data.sender, decryptFromWire(data.content), Date.now());
+          (async () => {
+            const text = await decryptFromWire(data.chatId, data.content);
+            addLiveMessage(data.chatId, data.sender, text, Date.now(), data.messageId);
+          })();
           break;
         }
         case "MSG_DELIVERED": {
+
+          if (activeChatId && messagesByChat[activeChatId]) {
+            const msgs = messagesByChat[activeChatId];
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].sender === myLogin && !msgs[i].id) {
+                msgs[i].id = data.messageId;
+                break;
+              }
+            }
+          }
           break;
         }
         case "USER_STATUS_UPDATE": {
-          if (data.online === "true") onlineUsers.add(data.login);
-          else onlineUsers.delete(data.login);
+          console.log("=== ОНОВЛЕННЯ СТАТУСУ ===", data);
+          if (data.online === "true") {
+            onlineUsers.add(data.login);
+          } else {
+            onlineUsers.delete(data.login);
+          }
+          console.log("Поточний Set онлайн-користувачів:", Array.from(onlineUsers));
+          renderChatList();
           break;
         }
         case "ADMIN_ACTION_RESULT": {
           if (data.result === "stats") {
             showToast(`Активних з'єднань: ${data.connections}`);
-          } else {
+          } else if (data.result === "REFRESH_HISTORY") {
+            if (data.chatId === activeChatId) {
+              ASAPClient.send("GET_HISTORY", {chatId: activeChatId});
+            }
+          }else {
             showToast(data.result);
           }
           break;
@@ -375,17 +518,24 @@
       if (e.key === "Enter") sendCurrentMessage();
     });
 
-    function sendCurrentMessage() {
+    async function sendCurrentMessage() {
       const input = document.getElementById("message-input");
       const text = input.value.trim();
       if (!text || !activeChatId) return;
+      input.value = "";
 
+      const keyReady = await ensureChatKey(activeChatId);
+      if (!keyReady) {
+        showToast("Очікую обмін ключем шифрування з учасником чату...");
+        return;
+      }
+
+      const encrypted = await encryptForWire(activeChatId, text);
       ASAPClient.send("SEND_MSG", {
         chatId: activeChatId,
-        content: encryptForWire(text)
+        content: encrypted
       });
       addLiveMessage(activeChatId, myLogin, text, Date.now());
-      input.value = "";
     }
 
     document.getElementById("ban-btn").addEventListener("click", () => {
@@ -403,7 +553,7 @@
       showToast("Не вдалося з'єднатися з WebGateway");
     });
 
-    window.editMessage = function(chatId, msgIndex) {
+    window.editMessage = async function(chatId, msgIndex) {
       const msg = messagesByChat[chatId][msgIndex];
       const newText = prompt("Редагувати повідомлення:", msg.text);
       if (newText === null || newText.trim() === "") return;
@@ -412,10 +562,11 @@
       renderMessages(chatId);
 
       if (msg.id) {
+        const encrypted = await encryptForWire(chatId, newText.trim());
         ASAPClient.send("ADMIN_ACTION", {
           action: "EDIT_MESSAGE",
           messageId: msg.id,
-          target: encryptForWire(newText.trim())
+          target: encrypted
         });
       }
     };

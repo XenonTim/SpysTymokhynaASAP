@@ -5,21 +5,6 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.github.cdimascio.dotenv.Dotenv;
 
-/**
- * Єдина точка підключення до MongoDB.
- *
- * URI бази береться (у порядку пріоритету):
- *   1. .env файл
- *   2. JVM system property -DMONGO_URI=...
- *   3. Змінна середовища MONGO_URI
- *   4. Локальний MongoDB за замовчуванням (mongodb://localhost:27017)
- *
- * Для MongoDB Atlas задайте рядок підключення з вашого кластера, наприклад:
- *   mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=true&w=majority
- *
- * Назву бази даних також можна перевизначити через MONGO_DB_NAME,
- * інакше використовується "asap_messenger".
- */
 public class MongoDBConnection {
 
     private static final String DEFAULT_URI = "mongodb://localhost:27017";

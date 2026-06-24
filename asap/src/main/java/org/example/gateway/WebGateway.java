@@ -10,18 +10,6 @@ import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * Веб-шлюз (WebGateway).
- *
- * Не підмінює ASAP-протокол і не замінює org.example.server.network.Server —
- * це окремий, тонкий процес, який:
- *   1. Роздає браузеру статичні файли клієнта (HTML/CSS/JS) з каталогу webapp/.
- *   2. Приймає WebSocket-з'єднання на шляху /ws і для кожного з них відкриває
- *      власне TCP-з'єднання до основного ASAP Server (порт 8080), перекладаючи
- *      JSON ↔ кастомні Packet (див. ClientSessionBridge).
- *
- * Запускати після того, як основний Server вже працює на порту 8080.
- */
 public class WebGateway {
 
     private static final int HTTP_PORT = 8081;
