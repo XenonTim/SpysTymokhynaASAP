@@ -43,6 +43,8 @@ public class ClientHandler implements Runnable {
     private SecretKey aesSessionKey;
     private boolean isHandshakeComplete = false;
 
+    private volatile boolean disconnected = false;
+
     public ClientHandler(Socket socket, SessionRegistry sessionRegistry,
                          MessageRepository messageRepository,
                          ChatRepository chatRepository,
@@ -100,7 +102,7 @@ public class ClientHandler implements Runnable {
         out.write(publicKeyBytes);
         out.flush();
 
-        in.readInt(); // пропускаємо код KEY_EXCHANGE_RESP
+        in.readInt();
         int encAesLength = in.readInt();
         byte[] encryptedAesKey = new byte[encAesLength];
         in.readFully(encryptedAesKey);
@@ -110,26 +112,22 @@ public class ClientHandler implements Runnable {
         this.isHandshakeComplete = true;
     }
 
-    // ─── Диспетчер пакетів ───────────────────────────────────────────────────
-
     private void handlePacket(PacketType type, String payload) {
         switch (type) {
-            case REGISTER_REQUEST      -> processRegistration(payload);
-            case LOGIN_REQUEST         -> processLogin(payload);
-            case SEND_MSG              -> processSendMessage(payload);
-            case EDIT_MESSAGE_REQUEST  -> processEditMessage(payload);
-            case DELETE_MESSAGE_REQUEST-> processDeleteMessage(payload);
-            case CREATE_CHAT           -> handleCreateChat(payload);
-            case ADMIN_ACTION          -> processAdminAction(payload);
-            case GET_HISTORY           -> processGetHistory(payload);
-            case GET_CONTACTS          -> processGetContacts();
-            case PING                  -> sendPacket(PacketType.PING, "PONG");
-            case DISCONNECT            -> disconnectCleanly();
-            default                    -> sendPacket(PacketType.ERROR, "Невідомий тип пакета");
+            case REGISTER_REQUEST       -> processRegistration(payload);
+            case LOGIN_REQUEST          -> processLogin(payload);
+            case SEND_MSG               -> processSendMessage(payload);
+            case EDIT_MESSAGE_REQUEST   -> processEditMessage(payload);
+            case DELETE_MESSAGE_REQUEST -> processDeleteMessage(payload);
+            case CREATE_CHAT            -> handleCreateChat(payload);
+            case ADMIN_ACTION           -> processAdminAction(payload);
+            case GET_HISTORY            -> processGetHistory(payload);
+            case GET_CONTACTS           -> processGetContacts();
+            case PING                   -> sendPacket(PacketType.PING, "PONG");
+            case DISCONNECT             -> disconnectCleanly();
+            default                     -> sendPacket(PacketType.ERROR, "Невідомий тип пакета");
         }
     }
-
-    // ─── Реєстрація ──────────────────────────────────────────────────────────
 
     private void processRegistration(String payload) {
         Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
@@ -143,7 +141,6 @@ public class ClientHandler implements Runnable {
         if (userRepository.exists(login)) {
             sendPacket(PacketType.REGISTER_FAILED, "Логін зайнятий");
         } else {
-            // Хешуємо пароль на сервері (клієнт надсилає plain-текст)
             String hashed = PasswordUtil.hash(password);
             User newUser = new User(login, hashed, Role.USER);
             userRepository.save(newUser);
@@ -152,8 +149,6 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    // ─── Авторизація ─────────────────────────────────────────────────────────
-
     private void processLogin(String payload) {
         Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
         String login    = fields.getOrDefault("login", "");
@@ -161,7 +156,6 @@ public class ClientHandler implements Runnable {
 
         User user = userRepository.findByLogin(login);
 
-        // ВИПРАВЛЕНО: використовуємо BCrypt.verify замість equals
         if (user != null && PasswordUtil.verify(password, user.getPasswordHash())) {
             if (user.getStatus() == UserStatus.BANNED) {
                 sendPacket(PacketType.LOGIN_FAILED, "Акаунт заблоковано");
@@ -182,16 +176,10 @@ public class ClientHandler implements Runnable {
         sessionRegistry.broadcastAll(PacketType.USER_STATUS_UPDATE, currentUserLogin + ":ONLINE");
     }
 
-    // ─── Відправка повідомлення ───────────────────────────────────────────────
-
-    /**
-     * Payload JSON: {"chatId":"...","content":"..."}
-     * Розсилає всім членам чату (групова + приватна логіка).
-     */
     private void processSendMessage(String payload) {
         Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
-        String chatId  = fields.getOrDefault("chatId", "");
-        String text    = fields.getOrDefault("content", "");
+        String chatId = fields.getOrDefault("chatId", "");
+        String text   = fields.getOrDefault("content", "");
 
         if (chatId.isBlank()) {
             sendPacket(PacketType.ERROR, "chatId не вказано");
@@ -202,7 +190,6 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        // Зберігаємо в БД
         Message message = new Message();
         message.setChatId(chatId);
         message.setSenderLogin(currentUserLogin);
@@ -210,12 +197,11 @@ public class ClientHandler implements Runnable {
         message.setSentAt(Instant.now());
         messageRepository.save(message);
 
-        // ВИПРАВЛЕНО: розсилаємо всім членам чату (а не лише одному recipientId)
         Chat chat = chatRepository.findById(chatId);
         if (chat != null && chat.getMemberLogins() != null) {
             String notifyPayload = chatId + ":" + currentUserLogin + ":" + text;
             for (String member : chat.getMemberLogins()) {
-                if (member.equals(currentUserLogin)) continue; // собі не надсилаємо
+                if (member.equals(currentUserLogin)) continue;
                 ClientHandler target = sessionRegistry.getHandler(member);
                 if (target != null) {
                     target.sendPacket(PacketType.RECEIVE_MSG, notifyPayload);
@@ -224,24 +210,37 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    // ─── Редагування повідомлення ─────────────────────────────────────────────
-
     private void processEditMessage(String payload) {
-        String[] parts = payload.split(":", 2);
-        if (parts.length < 2) return;
-        String messageId = parts[0].trim();
-        String newText   = parts[1];
+        Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+        String messageId = fields.getOrDefault("messageId", "").trim();
+        String newText   = fields.getOrDefault("content", "");
 
-        if (newText == null || newText.trim().isEmpty() || newText.length() > 4000) return;
+        if (messageId.isBlank()) {
+            sendPacket(PacketType.ERROR, "messageId не вказано");
+            return;
+        }
+        if (newText.isBlank() || newText.length() > 4000) {
+            sendPacket(PacketType.ERROR, "Некоректний вміст повідомлення");
+            return;
+        }
 
         Message msg = messageRepository.findById(messageId);
-        if (msg == null || !msg.getSenderLogin().equals(currentUserLogin)) return;
+        if (msg == null) {
+            sendPacket(PacketType.ERROR, "Повідомлення не знайдено");
+            return;
+        }
+        if (!msg.getSenderLogin().equals(currentUserLogin)) {
+            sendPacket(PacketType.ERROR, "Недостатньо прав для редагування");
+            return;
+        }
 
         messageRepository.updateContent(messageId, newText);
+        sendPacket(PacketType.MESSAGE_EDITED, messageId + ":" + newText);
 
         Chat chat = chatRepository.findById(msg.getChatId());
         if (chat != null && chat.getMemberLogins() != null) {
             for (String member : chat.getMemberLogins()) {
+                if (member.equals(currentUserLogin)) continue;
                 ClientHandler target = sessionRegistry.getHandler(member);
                 if (target != null) {
                     target.sendPacket(PacketType.MESSAGE_EDITED, messageId + ":" + newText);
@@ -250,12 +249,13 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    // ─── Видалення повідомлення ───────────────────────────────────────────────
-
     private void processDeleteMessage(String payload) {
         String messageId = payload.trim();
         Message msg = messageRepository.findById(messageId);
-        if (msg == null) return;
+        if (msg == null) {
+            sendPacket(PacketType.ERROR, "Повідомлення не знайдено");
+            return;
+        }
 
         boolean isAuthor = msg.getSenderLogin().equals(currentUserLogin);
         boolean isAdmin  = currentUserRole == Role.ADMIN;
@@ -270,23 +270,20 @@ public class ClientHandler implements Runnable {
                     if (target != null) target.sendPacket(PacketType.MESSAGE_DELETED, messageId);
                 }
             }
+        } else {
+            sendPacket(PacketType.ERROR, "Недостатньо прав для видалення");
         }
     }
 
-    // ─── Створення чату ───────────────────────────────────────────────────────
-
-    /**
-     * Payload JSON: {"type":"GROUP","name":"...","members":"login1,login2"}
-     * або старий формат: "chatName;login1,login2"
-     */
     private void handleCreateChat(String payload) {
         String chatName;
         List<String> userIds;
+        String typeFromPayload = "GROUP";
 
-        // Спроба JSON-формату (від TestClient)
         if (payload.trim().startsWith("{")) {
             Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
-            chatName = fields.getOrDefault("name", "Новий чат");
+            chatName       = fields.getOrDefault("name", "Новий чат");
+            typeFromPayload = fields.getOrDefault("type", "GROUP");
             String members = fields.getOrDefault("members", "");
             userIds = new ArrayList<>();
             for (String m : members.split(",")) {
@@ -294,7 +291,6 @@ public class ClientHandler implements Runnable {
                 if (!t.isEmpty()) userIds.add(t);
             }
         } else {
-            // Старий формат: "chatName;login1,login2"
             String[] parts = payload.split(";", 2);
             if (parts.length < 2) return;
             chatName = parts[0];
@@ -305,7 +301,6 @@ public class ClientHandler implements Runnable {
             }
         }
 
-        // ВИПРАВЛЕНО: творець чату завжди включається як перший учасник
         if (!userIds.contains(currentUserLogin)) {
             userIds.add(0, currentUserLogin);
         }
@@ -315,16 +310,22 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        String newChatId = chatRepository.createNewChat(chatName, userIds);
-        sendPacket(PacketType.CHAT_CREATED, newChatId);
+        Chat.Type chatType = (userIds.size() == 2 || "PRIVATE".equalsIgnoreCase(typeFromPayload))
+                ? Chat.Type.PRIVATE
+                : Chat.Type.GROUP;
+
+        String newChatId = chatRepository.createNewChat(chatName, userIds, chatType);
+        sendPacket(PacketType.CHAT_CREATED, newChatId + ":" + chatName);
+
+        for (String member : userIds) {
+            if (member.equals(currentUserLogin)) continue;
+            ClientHandler target = sessionRegistry.getHandler(member);
+            if (target != null) {
+                target.sendPacket(PacketType.CHAT_CREATED, newChatId + ":" + chatName);
+            }
+        }
     }
 
-    // ─── Адмін дії ────────────────────────────────────────────────────────────
-
-    /**
-     * ВИПРАВЛЕНО: BAN_USER лише блокує (змінює статус), DELETE_USER — видаляє.
-     * Додано SERVER_STATS згідно з ТЗ.
-     */
     private void processAdminAction(String payload) {
         if (currentUserRole != Role.ADMIN) {
             sendPacket(PacketType.ERROR, "Недостатньо прав");
@@ -336,7 +337,6 @@ public class ClientHandler implements Runnable {
         String targetUsername = fields.getOrDefault("target", "");
 
         if ("BAN_USER".equals(command)) {
-            // Лише блокуємо — не видаляємо запис
             userRepository.updateStatus(targetUsername, UserStatus.BANNED);
 
             ClientHandler target = sessionRegistry.getHandler(targetUsername);
@@ -348,7 +348,11 @@ public class ClientHandler implements Runnable {
             sessionRegistry.broadcastAll(PacketType.USER_LIST_UPDATED, targetUsername + ":BANNED");
 
         } else if ("DELETE_USER".equals(command)) {
-            // Повне видалення: з БД та з усіх чатів
+            if (targetUsername.equals(currentUserLogin)) {
+                sendPacket(PacketType.ERROR, "Неможливо видалити власний акаунт");
+                return;
+            }
+
             userRepository.deleteByLogin(targetUsername);
             chatRepository.removeMemberFromAllChats(targetUsername);
 
@@ -361,7 +365,6 @@ public class ClientHandler implements Runnable {
             sessionRegistry.broadcastAll(PacketType.USER_LIST_UPDATED, targetUsername + ":DELETED");
 
         } else if ("SERVER_STATS".equals(command)) {
-            // Статистика сервера (згідно з ТЗ: адмін може переглядати активні підключення)
             int activeCount = sessionRegistry.getActiveCount();
             sendPacket(PacketType.ADMIN_SUCCESS, "Активних підключень: " + activeCount);
 
@@ -370,12 +373,6 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    // ─── Історія чату ─────────────────────────────────────────────────────────
-
-    /**
-     * ВИПРАВЛЕНО: Додано обробник GET_HISTORY.
-     * Payload JSON: {"chatId":"..."}
-     */
     private void processGetHistory(String payload) {
         Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
         String chatId = fields.getOrDefault("chatId", "");
@@ -385,7 +382,6 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        // Перевіряємо, чи є користувач членом чату
         Chat chat = chatRepository.findById(chatId);
         if (chat == null || !chat.getMemberLogins().contains(currentUserLogin)) {
             sendPacket(PacketType.ERROR, "Немає доступу до цього чату");
@@ -394,7 +390,6 @@ public class ClientHandler implements Runnable {
 
         List<Message> messages = messageRepository.findByChatId(chatId);
 
-        // Формуємо JSON-масив повідомлень
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < messages.size(); i++) {
             Message m = messages.get(i);
@@ -411,12 +406,6 @@ public class ClientHandler implements Runnable {
         sendPacket(PacketType.GET_HISTORY, chatId + ":" + sb);
     }
 
-    // ─── Контакти ─────────────────────────────────────────────────────────────
-
-    /**
-     * ВИПРАВЛЕНО: Додано обробник GET_CONTACTS.
-     * Повертає список чатів, в яких перебуває користувач.
-     */
     private void processGetContacts() {
         if (currentUserLogin == null) {
             sendPacket(PacketType.ERROR, "Не авторизовано");
@@ -440,26 +429,28 @@ public class ClientHandler implements Runnable {
         sendPacket(PacketType.GET_CONTACTS, sb.toString());
     }
 
-    // ─── Відключення ──────────────────────────────────────────────────────────
-
     public void disconnectCleanly() {
-        try {
-            if (currentUserLogin != null) {
-                userRepository.updateOnlineStatus(currentUserLogin, false);
-                sessionRegistry.removeSession(currentUserLogin);
-                sessionRegistry.broadcastAll(PacketType.USER_STATUS_UPDATE, currentUserLogin + ":OFFLINE");
+        if (!disconnected) {
+            synchronized (this) {
+                if (disconnected) return;
+                disconnected = true;
             }
-            if (in  != null) in.close();
-            if (out != null) out.close();
-            if (socket != null && !socket.isClosed()) socket.close();
-        } catch (IOException e) {
-            System.err.println("Помилка закриття: " + e.getMessage());
+            try {
+                if (currentUserLogin != null) {
+                    userRepository.updateOnlineStatus(currentUserLogin, false);
+                    sessionRegistry.removeSession(currentUserLogin);
+                    sessionRegistry.broadcastAll(PacketType.USER_STATUS_UPDATE, currentUserLogin + ":OFFLINE");
+                }
+                if (in  != null) in.close();
+                if (out != null) out.close();
+                if (socket != null && !socket.isClosed()) socket.close();
+            } catch (IOException e) {
+                System.err.println("Помилка закриття: " + e.getMessage());
+            }
         }
     }
 
-    // ─── Відправка пакета ─────────────────────────────────────────────────────
-
-    public void sendPacket(PacketType type, String plainPayload) {
+    public synchronized void sendPacket(PacketType type, String plainPayload) {
         try {
             byte[] payloadToSend;
 
@@ -478,8 +469,6 @@ public class ClientHandler implements Runnable {
             System.err.println("Помилка відправки: " + e.getMessage());
         }
     }
-
-    // ─── Утиліта ──────────────────────────────────────────────────────────────
 
     private String escapeJson(String s) {
         if (s == null) return "";

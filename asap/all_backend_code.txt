@@ -1,0 +1,2200 @@
+package org.example.server.network;
+
+import org.example.shared.protocol.PacketType;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+public class SessionRegistry {
+
+    private final ConcurrentHashMap<String, ClientHandler> handlers = new ConcurrentHashMap<>();
+
+    public void addSession(String login, ClientHandler handler) {
+        handlers.put(login, handler);
+    }
+
+    public void removeSession(String login) {
+        handlers.remove(login);
+    }
+
+    public boolean isUserOnline(String login) {
+        return handlers.containsKey(login);
+    }
+
+    public ClientHandler getHandler(String login) {
+        return handlers.get(login);
+    }
+
+    public void kickUser(String login) {
+        ClientHandler handler = handlers.remove(login);
+        if (handler != null) {
+            handler.disconnectCleanly();
+        }
+    }
+    public int getActiveCount() {
+        return handlers.size();
+    }
+    // Розсилка всім підключеним клієнтам (наприклад, для статусів ONLINE/OFFLINE)
+    public void broadcastAll(PacketType type, String payload) {
+        handlers.values().forEach(handler -> {
+            try {
+                handler.sendPacket(type, payload);
+            } catch (Exception ignored) {}
+        });
+    }
+}package org.example.server.network;
+
+import org.example.shared.protocol.PacketType;
+import org.example.shared.protocol.PayloadBuilder;
+import org.example.db.MessageRepository;
+import org.example.db.ChatRepository;
+import org.example.db.UserRepository;
+import org.example.models.Message;
+import org.example.models.Chat;
+import org.example.models.Role;
+import org.example.models.User;
+import org.example.models.UserStatus;
+import org.example.shared.security.AesUtil;
+import org.example.shared.security.PasswordUtil;
+import org.example.shared.security.RsaUtil;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public class ClientHandler implements Runnable {
+
+    private final Socket socket;
+    private DataInputStream in;
+    private DataOutputStream out;
+
+    private final SessionRegistry sessionRegistry;
+    private final MessageRepository messageRepository;
+    private final ChatRepository chatRepository;
+    private final UserRepository userRepository;
+
+    private String currentUserLogin;
+    private Role currentUserRole;
+
+    private SecretKey aesSessionKey;
+    private boolean isHandshakeComplete = false;
+
+    public ClientHandler(Socket socket, SessionRegistry sessionRegistry,
+                         MessageRepository messageRepository,
+                         ChatRepository chatRepository,
+                         UserRepository userRepository) {
+        this.socket = socket;
+        this.sessionRegistry = sessionRegistry;
+        this.messageRepository = messageRepository;
+        this.chatRepository = chatRepository;
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    public void run() {
+        try {
+            in  = new DataInputStream(socket.getInputStream());
+            out = new DataOutputStream(socket.getOutputStream());
+
+            executeKeyExchangeHandshake();
+
+            while (!socket.isClosed()) {
+                int packetTypeCode = in.readInt();
+                int payloadLength  = in.readInt();
+
+                byte[] rawPayload = new byte[payloadLength];
+                if (payloadLength > 0) in.readFully(rawPayload);
+
+                PacketType type = PacketType.fromCode(packetTypeCode);
+                String decryptedPayload;
+
+                if (isHandshakeComplete
+                        && type != PacketType.DISCONNECT
+                        && type != PacketType.KEY_EXCHANGE_INIT) {
+                    String encryptedBase64 = new String(rawPayload, StandardCharsets.UTF_8);
+                    decryptedPayload = AesUtil.decrypt(encryptedBase64, aesSessionKey);
+                } else {
+                    decryptedPayload = new String(rawPayload, StandardCharsets.UTF_8);
+                }
+
+                handlePacket(type, decryptedPayload);
+            }
+
+        } catch (Exception e) {
+            System.err.println("Обрив з'єднання або помилка: " + e.getMessage());
+        } finally {
+            disconnectCleanly();
+        }
+    }
+
+    private void executeKeyExchangeHandshake() throws Exception {
+        var serverKeyPair = RsaUtil.generateKeyPair();
+        byte[] publicKeyBytes = serverKeyPair.getPublic().getEncoded();
+
+        out.writeInt(PacketType.KEY_EXCHANGE_INIT.getCode());
+        out.writeInt(publicKeyBytes.length);
+        out.write(publicKeyBytes);
+        out.flush();
+
+        in.readInt(); // пропускаємо код KEY_EXCHANGE_RESP
+        int encAesLength = in.readInt();
+        byte[] encryptedAesKey = new byte[encAesLength];
+        in.readFully(encryptedAesKey);
+
+        byte[] decryptedKeyBytes = RsaUtil.decryptWithPrivateKey(encryptedAesKey, serverKeyPair.getPrivate());
+        this.aesSessionKey = new SecretKeySpec(decryptedKeyBytes, 0, decryptedKeyBytes.length, "AES");
+        this.isHandshakeComplete = true;
+    }
+
+    // ─── Диспетчер пакетів ───────────────────────────────────────────────────
+
+    private void handlePacket(PacketType type, String payload) {
+        switch (type) {
+            case REGISTER_REQUEST      -> processRegistration(payload);
+            case LOGIN_REQUEST         -> processLogin(payload);
+            case SEND_MSG              -> processSendMessage(payload);
+            case EDIT_MESSAGE_REQUEST  -> processEditMessage(payload);
+            case DELETE_MESSAGE_REQUEST-> processDeleteMessage(payload);
+            case CREATE_CHAT           -> handleCreateChat(payload);
+            case ADMIN_ACTION          -> processAdminAction(payload);
+            case GET_HISTORY           -> processGetHistory(payload);
+            case GET_CONTACTS          -> processGetContacts();
+            case PING                  -> sendPacket(PacketType.PING, "PONG");
+            case DISCONNECT            -> disconnectCleanly();
+            default                    -> sendPacket(PacketType.ERROR, "Невідомий тип пакета");
+        }
+    }
+
+    // ─── Реєстрація ──────────────────────────────────────────────────────────
+
+    private void processRegistration(String payload) {
+        Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+        String login    = fields.getOrDefault("login", "");
+        String password = fields.getOrDefault("password", "");
+
+        if (login.isBlank() || password.isBlank()) {
+            sendPacket(PacketType.REGISTER_FAILED, "Логін або пароль порожні");
+            return;
+        }
+        if (userRepository.exists(login)) {
+            sendPacket(PacketType.REGISTER_FAILED, "Логін зайнятий");
+        } else {
+            // Хешуємо пароль на сервері (клієнт надсилає plain-текст)
+            String hashed = PasswordUtil.hash(password);
+            User newUser = new User(login, hashed, Role.USER);
+            userRepository.save(newUser);
+            authorizeUser(newUser);
+            sendPacket(PacketType.REGISTER_SUCCESS, "Успіх");
+        }
+    }
+
+    // ─── Авторизація ─────────────────────────────────────────────────────────
+
+    private void processLogin(String payload) {
+        Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+        String login    = fields.getOrDefault("login", "");
+        String password = fields.getOrDefault("password", "");
+
+        User user = userRepository.findByLogin(login);
+
+        // ВИПРАВЛЕНО: використовуємо BCrypt.verify замість equals
+        if (user != null && PasswordUtil.verify(password, user.getPasswordHash())) {
+            if (user.getStatus() == UserStatus.BANNED) {
+                sendPacket(PacketType.LOGIN_FAILED, "Акаунт заблоковано");
+                return;
+            }
+            authorizeUser(user);
+            sendPacket(PacketType.LOGIN_SUCCESS, "Успіх");
+        } else {
+            sendPacket(PacketType.LOGIN_FAILED, "Невірний логін або пароль");
+        }
+    }
+
+    private void authorizeUser(User user) {
+        this.currentUserLogin = user.getLogin();
+        this.currentUserRole  = user.getRole();
+        userRepository.updateOnlineStatus(currentUserLogin, true);
+        sessionRegistry.addSession(currentUserLogin, this);
+        sessionRegistry.broadcastAll(PacketType.USER_STATUS_UPDATE, currentUserLogin + ":ONLINE");
+    }
+
+    // ─── Відправка повідомлення ───────────────────────────────────────────────
+
+    /**
+     * Payload JSON: {"chatId":"...","content":"..."}
+     * Розсилає всім членам чату (групова + приватна логіка).
+     */
+    private void processSendMessage(String payload) {
+        Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+        String chatId  = fields.getOrDefault("chatId", "");
+        String text    = fields.getOrDefault("content", "");
+
+        if (chatId.isBlank()) {
+            sendPacket(PacketType.ERROR, "chatId не вказано");
+            return;
+        }
+        if (text.isBlank() || text.length() > 4000) {
+            sendPacket(PacketType.ERROR, "Некоректна довжина повідомлення");
+            return;
+        }
+
+        // Зберігаємо в БД
+        Message message = new Message();
+        message.setChatId(chatId);
+        message.setSenderLogin(currentUserLogin);
+        message.setEncryptedContent(text);
+        message.setSentAt(Instant.now());
+        messageRepository.save(message);
+
+        // ВИПРАВЛЕНО: розсилаємо всім членам чату (а не лише одному recipientId)
+        Chat chat = chatRepository.findById(chatId);
+        if (chat != null && chat.getMemberLogins() != null) {
+            String notifyPayload = chatId + ":" + currentUserLogin + ":" + text;
+            for (String member : chat.getMemberLogins()) {
+                if (member.equals(currentUserLogin)) continue; // собі не надсилаємо
+                ClientHandler target = sessionRegistry.getHandler(member);
+                if (target != null) {
+                    target.sendPacket(PacketType.RECEIVE_MSG, notifyPayload);
+                }
+            }
+        }
+    }
+
+    // ─── Редагування повідомлення ─────────────────────────────────────────────
+
+    private void processEditMessage(String payload) {
+        String[] parts = payload.split(":", 2);
+        if (parts.length < 2) return;
+        String messageId = parts[0].trim();
+        String newText   = parts[1];
+
+        if (newText == null || newText.trim().isEmpty() || newText.length() > 4000) return;
+
+        Message msg = messageRepository.findById(messageId);
+        if (msg == null || !msg.getSenderLogin().equals(currentUserLogin)) return;
+
+        messageRepository.updateContent(messageId, newText);
+
+        Chat chat = chatRepository.findById(msg.getChatId());
+        if (chat != null && chat.getMemberLogins() != null) {
+            for (String member : chat.getMemberLogins()) {
+                ClientHandler target = sessionRegistry.getHandler(member);
+                if (target != null) {
+                    target.sendPacket(PacketType.MESSAGE_EDITED, messageId + ":" + newText);
+                }
+            }
+        }
+    }
+
+    // ─── Видалення повідомлення ───────────────────────────────────────────────
+
+    private void processDeleteMessage(String payload) {
+        String messageId = payload.trim();
+        Message msg = messageRepository.findById(messageId);
+        if (msg == null) return;
+
+        boolean isAuthor = msg.getSenderLogin().equals(currentUserLogin);
+        boolean isAdmin  = currentUserRole == Role.ADMIN;
+
+        if (isAuthor || isAdmin) {
+            messageRepository.deleteById(messageId);
+
+            Chat chat = chatRepository.findById(msg.getChatId());
+            if (chat != null && chat.getMemberLogins() != null) {
+                for (String member : chat.getMemberLogins()) {
+                    ClientHandler target = sessionRegistry.getHandler(member);
+                    if (target != null) target.sendPacket(PacketType.MESSAGE_DELETED, messageId);
+                }
+            }
+        }
+    }
+
+    // ─── Створення чату ───────────────────────────────────────────────────────
+
+    /**
+     * Payload JSON: {"type":"GROUP","name":"...","members":"login1,login2"}
+     * або старий формат: "chatName;login1,login2"
+     */
+    private void handleCreateChat(String payload) {
+        String chatName;
+        List<String> userIds;
+
+        // Спроба JSON-формату (від TestClient)
+        if (payload.trim().startsWith("{")) {
+            Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+            chatName = fields.getOrDefault("name", "Новий чат");
+            String members = fields.getOrDefault("members", "");
+            userIds = new ArrayList<>();
+            for (String m : members.split(",")) {
+                String t = m.trim();
+                if (!t.isEmpty()) userIds.add(t);
+            }
+        } else {
+            // Старий формат: "chatName;login1,login2"
+            String[] parts = payload.split(";", 2);
+            if (parts.length < 2) return;
+            chatName = parts[0];
+            userIds = new ArrayList<>();
+            for (String m : parts[1].split(",")) {
+                String t = m.trim();
+                if (!t.isEmpty()) userIds.add(t);
+            }
+        }
+
+        // ВИПРАВЛЕНО: творець чату завжди включається як перший учасник
+        if (!userIds.contains(currentUserLogin)) {
+            userIds.add(0, currentUserLogin);
+        }
+
+        if (userIds.size() < 2) {
+            sendPacket(PacketType.ERROR, "Неможливо створити чат без інших учасників");
+            return;
+        }
+
+        String newChatId = chatRepository.createNewChat(chatName, userIds);
+        sendPacket(PacketType.CHAT_CREATED, newChatId);
+    }
+
+    // ─── Адмін дії ────────────────────────────────────────────────────────────
+
+    /**
+     * ВИПРАВЛЕНО: BAN_USER лише блокує (змінює статус), DELETE_USER — видаляє.
+     * Додано SERVER_STATS згідно з ТЗ.
+     */
+    private void processAdminAction(String payload) {
+        if (currentUserRole != Role.ADMIN) {
+            sendPacket(PacketType.ERROR, "Недостатньо прав");
+            return;
+        }
+
+        Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+        String command        = fields.getOrDefault("action", "");
+        String targetUsername = fields.getOrDefault("target", "");
+
+        if ("BAN_USER".equals(command)) {
+            // Лише блокуємо — не видаляємо запис
+            userRepository.updateStatus(targetUsername, UserStatus.BANNED);
+
+            ClientHandler target = sessionRegistry.getHandler(targetUsername);
+            if (target != null) {
+                target.sendPacket(PacketType.BANNED_NOTIFICATION, "Ваш акаунт заблоковано");
+                sessionRegistry.kickUser(targetUsername);
+            }
+            sendPacket(PacketType.ADMIN_SUCCESS, "Користувача заблоковано");
+            sessionRegistry.broadcastAll(PacketType.USER_LIST_UPDATED, targetUsername + ":BANNED");
+
+        } else if ("DELETE_USER".equals(command)) {
+            // Повне видалення: з БД та з усіх чатів
+            userRepository.deleteByLogin(targetUsername);
+            chatRepository.removeMemberFromAllChats(targetUsername);
+
+            ClientHandler target = sessionRegistry.getHandler(targetUsername);
+            if (target != null) {
+                target.sendPacket(PacketType.BANNED_NOTIFICATION, "Ваш акаунт видалено");
+                sessionRegistry.kickUser(targetUsername);
+            }
+            sendPacket(PacketType.ADMIN_SUCCESS, "Користувача видалено");
+            sessionRegistry.broadcastAll(PacketType.USER_LIST_UPDATED, targetUsername + ":DELETED");
+
+        } else if ("SERVER_STATS".equals(command)) {
+            // Статистика сервера (згідно з ТЗ: адмін може переглядати активні підключення)
+            int activeCount = sessionRegistry.getActiveCount();
+            sendPacket(PacketType.ADMIN_SUCCESS, "Активних підключень: " + activeCount);
+
+        } else {
+            sendPacket(PacketType.ERROR, "Невідома адмін-команда: " + command);
+        }
+    }
+
+    // ─── Історія чату ─────────────────────────────────────────────────────────
+
+    /**
+     * ВИПРАВЛЕНО: Додано обробник GET_HISTORY.
+     * Payload JSON: {"chatId":"..."}
+     */
+    private void processGetHistory(String payload) {
+        Map<String, String> fields = PayloadBuilder.parse(payload.getBytes(StandardCharsets.UTF_8));
+        String chatId = fields.getOrDefault("chatId", "");
+
+        if (chatId.isBlank()) {
+            sendPacket(PacketType.ERROR, "chatId не вказано");
+            return;
+        }
+
+        // Перевіряємо, чи є користувач членом чату
+        Chat chat = chatRepository.findById(chatId);
+        if (chat == null || !chat.getMemberLogins().contains(currentUserLogin)) {
+            sendPacket(PacketType.ERROR, "Немає доступу до цього чату");
+            return;
+        }
+
+        List<Message> messages = messageRepository.findByChatId(chatId);
+
+        // Формуємо JSON-масив повідомлень
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < messages.size(); i++) {
+            Message m = messages.get(i);
+            if (i > 0) sb.append(",");
+            sb.append("{")
+                    .append("\"id\":\"").append(m.getId()).append("\",")
+                    .append("\"sender\":\"").append(m.getSenderLogin()).append("\",")
+                    .append("\"text\":\"").append(escapeJson(m.getEncryptedContent())).append("\",")
+                    .append("\"sentAt\":").append(m.getSentAt().toEpochMilli())
+                    .append("}");
+        }
+        sb.append("]");
+
+        sendPacket(PacketType.GET_HISTORY, chatId + ":" + sb);
+    }
+
+    // ─── Контакти ─────────────────────────────────────────────────────────────
+
+    /**
+     * ВИПРАВЛЕНО: Додано обробник GET_CONTACTS.
+     * Повертає список чатів, в яких перебуває користувач.
+     */
+    private void processGetContacts() {
+        if (currentUserLogin == null) {
+            sendPacket(PacketType.ERROR, "Не авторизовано");
+            return;
+        }
+
+        List<Chat> chats = chatRepository.findByMember(currentUserLogin);
+
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < chats.size(); i++) {
+            Chat c = chats.get(i);
+            if (i > 0) sb.append(",");
+            sb.append("{")
+                    .append("\"id\":\"").append(c.getId()).append("\",")
+                    .append("\"name\":\"").append(escapeJson(c.getName())).append("\",")
+                    .append("\"type\":\"").append(c.getType()).append("\"")
+                    .append("}");
+        }
+        sb.append("]");
+
+        sendPacket(PacketType.GET_CONTACTS, sb.toString());
+    }
+
+    // ─── Відключення ──────────────────────────────────────────────────────────
+
+    public void disconnectCleanly() {
+        try {
+            if (currentUserLogin != null) {
+                userRepository.updateOnlineStatus(currentUserLogin, false);
+                sessionRegistry.removeSession(currentUserLogin);
+                sessionRegistry.broadcastAll(PacketType.USER_STATUS_UPDATE, currentUserLogin + ":OFFLINE");
+            }
+            if (in  != null) in.close();
+            if (out != null) out.close();
+            if (socket != null && !socket.isClosed()) socket.close();
+        } catch (IOException e) {
+            System.err.println("Помилка закриття: " + e.getMessage());
+        }
+    }
+
+    // ─── Відправка пакета ─────────────────────────────────────────────────────
+
+    public void sendPacket(PacketType type, String plainPayload) {
+        try {
+            byte[] payloadToSend;
+
+            if (isHandshakeComplete && type != PacketType.KEY_EXCHANGE_INIT) {
+                String encryptedBase64 = AesUtil.encrypt(plainPayload, aesSessionKey);
+                payloadToSend = encryptedBase64.getBytes(StandardCharsets.UTF_8);
+            } else {
+                payloadToSend = plainPayload.getBytes(StandardCharsets.UTF_8);
+            }
+
+            out.writeInt(type.getCode());
+            out.writeInt(payloadToSend.length);
+            out.write(payloadToSend);
+            out.flush();
+        } catch (Exception e) {
+            System.err.println("Помилка відправки: " + e.getMessage());
+        }
+    }
+
+    // ─── Утиліта ──────────────────────────────────────────────────────────────
+
+    private String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n").replace("\r", "\\r");
+    }
+}package org.example.server.network;
+
+import org.example.db.ChatRepository;
+import org.example.db.MessageRepository;
+import org.example.db.UserRepository;
+
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class Server {
+
+    private static final int PORT = 8080;
+    private static final int THREAD_POOL_SIZE = 50;
+
+    public static void main(String[] args) {
+        // 1. Ініціалізація всіх необхідних компонентів для передачі в ClientHandler
+        SessionRegistry registry = new SessionRegistry();
+        UserRepository userRepository = new UserRepository();
+        MessageRepository messageRepository = new MessageRepository();
+        ChatRepository chatRepository = new ChatRepository();
+
+        System.out.println("[Server] ASAP Messenger started on port " + PORT);
+
+        // 2. Використовуємо try-with-resources для ExecutorService, щоб прибрати попередження
+        try (ServerSocket serverSocket = new ServerSocket(PORT);
+             ExecutorService pool = Executors.newFixedThreadPool(THREAD_POOL_SIZE)) {
+
+            // 3. Замінюємо while(true) на перевірку, щоб уникнути попередження "cannot complete"
+            while (!serverSocket.isClosed()) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("[Server] New connection: " + clientSocket.getInetAddress());
+
+                // Передаємо всі 5 аргументів (socket, registry, messageRepo, chatRepo, userRepo)
+                pool.execute(new ClientHandler(clientSocket, registry, messageRepository, chatRepository, userRepository));
+            }
+        } catch (Exception e) {
+            System.err.println("[Server] Fatal error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+}package org.example.shared.security;
+
+import javax.crypto.Cipher;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
+
+public class RsaUtil {
+
+    // Генерація пари ключів (Публічний + Приватний) для сервера
+    public static KeyPair generateKeyPair() throws Exception {
+        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+        keyGen.initialize(2048);
+        return keyGen.generateKeyPair();
+    }
+
+    // Перетворення байтів у PublicKey (X.509 формат)
+    public static PublicKey publicKeyFromBytes(byte[] bytes) throws Exception {
+        X509EncodedKeySpec spec = new X509EncodedKeySpec(bytes);
+        KeyFactory factory = KeyFactory.getInstance("RSA");
+        return factory.generatePublic(spec);
+    }
+
+    // Шифрування даних публічним ключем (для надсилання AES-ключа серверу)
+    public static byte[] encryptWithPublicKey(byte[] data, PublicKey key) throws Exception {
+        Cipher cipher = Cipher.getInstance("RSA");
+        cipher.init(Cipher.ENCRYPT_MODE, key);
+        return cipher.doFinal(data);
+    }
+
+    // Розшифрування даних приватним ключем (для отримання AES-ключа від клієнта)
+    public static byte[] decryptWithPrivateKey(byte[] data, PrivateKey key) throws Exception {
+        Cipher cipher = Cipher.getInstance("RSA");
+        cipher.init(Cipher.DECRYPT_MODE, key);
+        return cipher.doFinal(data);
+    }
+}package org.example.shared.security;
+
+import org.mindrot.jbcrypt.BCrypt;
+
+public class PasswordUtil {
+
+    private static final int WORK_FACTOR = 12;
+
+    public static String hash(String plainPassword) {
+        return BCrypt.hashpw(plainPassword, BCrypt.gensalt(WORK_FACTOR));
+    }
+
+    public static boolean verify(String plainPassword, String hashedPassword) {
+        return BCrypt.checkpw(plainPassword, hashedPassword);
+    }
+}
+package org.example.shared.security;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+public class AesUtil {
+
+    private static final String ALGORITHM = "AES/CBC/PKCS5Padding";
+    private static final int KEY_SIZE = 256;
+    private static final int IV_SIZE = 16;
+
+    public static SecretKey generateKey() throws Exception {
+        KeyGenerator kg = KeyGenerator.getInstance("AES");
+        kg.init(KEY_SIZE, new SecureRandom());
+        return kg.generateKey();
+    }
+
+    public static SecretKey keyFromBytes(byte[] raw) {
+        return new SecretKeySpec(raw, "AES");
+    }
+
+    public static String encrypt(String plainText, SecretKey key) throws Exception {
+        byte[] iv = new byte[IV_SIZE];
+        new SecureRandom().nextBytes(iv);
+        IvParameterSpec ivSpec = new IvParameterSpec(iv);
+
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.ENCRYPT_MODE, key, ivSpec);
+        byte[] encrypted = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+
+        byte[] result = new byte[IV_SIZE + encrypted.length];
+        System.arraycopy(iv, 0, result, 0, IV_SIZE);
+        System.arraycopy(encrypted, 0, result, IV_SIZE, encrypted.length);
+
+        return Base64.getEncoder().encodeToString(result);
+    }
+
+    public static String decrypt(String encryptedBase64, SecretKey key) throws Exception {
+        byte[] data = Base64.getDecoder().decode(encryptedBase64);
+
+        byte[] iv = new byte[IV_SIZE];
+        System.arraycopy(data, 0, iv, 0, IV_SIZE);
+        IvParameterSpec ivSpec = new IvParameterSpec(iv);
+
+        byte[] cipherText = new byte[data.length - IV_SIZE];
+        System.arraycopy(data, IV_SIZE, cipherText, 0, cipherText.length);
+
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.DECRYPT_MODE, key, ivSpec);
+        byte[] decrypted = cipher.doFinal(cipherText);
+
+        return new String(decrypted, StandardCharsets.UTF_8);
+    }
+}
+package org.example.shared.protocol;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+
+public class PacketIO {
+
+    // Записує пакет у int-code форматі
+    public static void write(DataOutputStream out, Packet packet) throws IOException {
+        byte[] payload = packet.getPayload() != null ? packet.getPayload() : new byte[0];
+        out.writeInt(packet.getType().getCode());
+        out.writeInt(payload.length);
+        if (payload.length > 0) {
+            out.write(payload);
+        }
+        out.flush();
+    }
+
+    // Читає пакет у int-code форматі
+    public static Packet read(DataInputStream in) throws IOException {
+        int typeCode = in.readInt();
+        PacketType type = PacketType.fromCode(typeCode);
+        int payloadLen = in.readInt();
+        byte[] payload = new byte[payloadLen];
+        if (payloadLen > 0) {
+            in.readFully(payload);
+        }
+        return new Packet(type, payload);
+    }
+}package org.example.shared.protocol;
+
+import java.io.Serializable;
+
+public class Packet implements Serializable {
+
+    private final PacketType type;
+    private final byte[] payload;
+
+    public Packet(PacketType type, byte[] payload) {
+        this.type = type;
+        this.payload = payload;
+    }
+
+    public PacketType getType() {
+        return type;
+    }
+
+    public byte[] getPayload() {
+        return payload;
+    }
+
+    public int getLength() {
+        return payload != null ? payload.length : 0;
+    }
+}
+package org.example.shared.protocol;
+
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+public class PayloadBuilder {
+
+    private final Map<String, String> fields = new HashMap<>();
+
+    public PayloadBuilder add(String key, String value) {
+        fields.put(key, value);
+        return this;
+    }
+
+    public byte[] build() {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> e : fields.entrySet()) {
+            if (!first) sb.append(",");
+            sb.append("\"").append(escape(e.getKey())).append("\":");
+            sb.append("\"").append(escape(e.getValue())).append("\"");
+            first = false;
+        }
+        sb.append("}");
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    public static Map<String, String> parse(byte[] payload) {
+        String json = new String(payload, StandardCharsets.UTF_8).trim();
+        Map<String, String> map = new HashMap<>();
+        if (payload == null || payload.length == 0) {
+            return map;
+        }
+        json = json.replaceAll("^\\{|\\}$", "");
+        for (String pair : json.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")) {
+            String[] kv = pair.split("\":\"", 2);
+            if (kv.length == 2) {
+                String key = kv[0].replaceAll("\"", "").trim();
+                String val = kv[1].replaceAll("\"$", "").trim();
+                map.put(key, unescape(val));
+            }
+        }
+        return map;
+    }
+
+    private String escape(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static String unescape(String s) {
+        return s.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+}
+package org.example.shared.protocol;
+
+public enum PacketType {
+    REGISTER_REQUEST(1), REGISTER_SUCCESS(2), REGISTER_FAILED(3),
+    LOGIN_REQUEST(4), LOGIN_SUCCESS(5), LOGIN_FAILED(6),
+    SEND_MSG(7), RECEIVE_MSG(8),
+    EDIT_MESSAGE_REQUEST(9), MESSAGE_EDITED(10),
+    DELETE_MESSAGE_REQUEST(11), MESSAGE_DELETED(12),
+    CREATE_CHAT(13), CHAT_CREATED(14),
+    USER_STATUS_UPDATE(15), USER_LIST_UPDATED(16),
+    KEY_EXCHANGE_INIT(17), KEY_EXCHANGE_RESP(18),
+    ADMIN_ACTION(19), ADMIN_SUCCESS(20), ERROR(21),
+    DISCONNECT(22), BANNED_NOTIFICATION(23),
+
+    // ДОДАНІ НОВІ ПАКЕТИ ДЛЯ КЛІЄНТА:
+    GET_HISTORY(24), GET_CONTACTS(25), PING(26);
+
+    private final int code;
+
+    PacketType(int code) {
+        this.code = code;
+    }
+
+    public int getCode() {
+        return code;
+    }
+
+    public static PacketType fromCode(int code) {
+        for (PacketType type : values()) {
+            if (type.code == code) return type;
+        }
+        return ERROR;
+    }
+}package org.example.models;
+
+import java.time.Instant;
+
+public class Message {
+
+    private String id;
+    private String chatId;
+    private String senderLogin;
+    private String encryptedContent;
+    private Instant sentAt;
+    private boolean deleted;
+
+    public Message() {}
+
+    public Message(String chatId, String senderLogin, String encryptedContent) {
+        this.chatId = chatId;
+        this.senderLogin = senderLogin;
+        this.encryptedContent = encryptedContent;
+        this.sentAt = Instant.now();
+        this.deleted = false;
+    }
+
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+
+    public String getChatId() { return chatId; }
+    public void setChatId(String chatId) { this.chatId = chatId; }
+
+    public String getSenderLogin() { return senderLogin; }
+    public void setSenderLogin(String senderLogin) { this.senderLogin = senderLogin; }
+
+    public String getEncryptedContent() { return encryptedContent; }
+    public void setEncryptedContent(String encryptedContent) { this.encryptedContent = encryptedContent; }
+
+    public Instant getSentAt() { return sentAt; }
+    public void setSentAt(Instant sentAt) { this.sentAt = sentAt; }
+
+    public boolean isDeleted() { return deleted; }
+    public void setDeleted(boolean deleted) { this.deleted = deleted; }
+}
+package org.example.models;
+
+public class User {
+    private String id;
+    private String login;
+    private String passwordHash;
+    private Role role;
+    private UserStatus status;
+
+    // Порожній конструктор
+    public User() {
+    }
+
+    // Конструктор з 3 параметрами (який використовується в UserRepository та ClientHandler)
+    public User(String login, String passwordHash, Role role) {
+        this.login = login;
+        this.passwordHash = passwordHash;
+        this.role = role;
+        this.status = UserStatus.ACTIVE; // За замовчуванням користувач активний
+    }
+
+    public String getLogin() {
+        return login;
+    }
+
+    public void setLogin(String login) {
+        this.login = login;
+    }
+
+    public String getPasswordHash() {
+        return passwordHash;
+    }
+
+    public void setPasswordHash(String passwordHash) {
+        this.passwordHash = passwordHash;
+    }
+
+    public Role getRole() {
+        return role;
+    }
+
+    public void setRole(Role role) {
+        this.role = role;
+    }
+
+    public UserStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(UserStatus status) {
+        this.status = status;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public void setId(String id) {
+        this.id = id;
+    }
+}package org.example.models;
+
+public enum UserStatus {
+    ACTIVE,
+    BANNED
+}package org.example.models;
+
+public enum Role {
+    USER,
+    ADMIN
+}package org.example.models;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class Chat {
+
+    public enum Type { PRIVATE, GROUP }
+
+    private String id;
+    private Type type;
+    private String name;
+    private List<String> memberLogins;
+
+    public Chat() {
+        this.memberLogins = new ArrayList<>();
+    }
+
+    public Chat(Type type, String name, List<String> memberLogins) {
+        this.type = type;
+        this.name = name;
+        this.memberLogins = memberLogins;
+    }
+
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+
+    public Type getType() { return type; }
+    public void setType(Type type) { this.type = type; }
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public List<String> getMemberLogins() { return memberLogins; }
+    public void setMemberLogins(List<String> memberLogins) { this.memberLogins = memberLogins; }
+}
+package org.example.db;
+
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.Sorts;
+import com.mongodb.client.model.Updates;
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.example.models.Message;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MessageRepository {
+
+    private static final int HISTORY_LIMIT = 50;
+    private final MongoCollection<Document> collection;
+
+    public MessageRepository() {
+        MongoDatabase db = MongoDBConnection.getDatabase();
+        this.collection = db.getCollection("messages");
+    }
+
+    // --- ВАШІ ОРИГІНАЛЬНІ МЕТОДИ ---
+
+    public void save(Message message) {
+        Document doc = new Document()
+                .append("chatId", message.getChatId())
+                .append("senderLogin", message.getSenderLogin())
+                .append("encryptedContent", message.getEncryptedContent())
+                .append("sentAt", message.getSentAt().toEpochMilli())
+                .append("deleted", false);
+        collection.insertOne(doc);
+        message.setId(doc.getObjectId("_id").toHexString());
+    }
+
+    public List<Message> findByChatId(String chatId) {
+        List<Message> messages = new ArrayList<>();
+        // Отримуємо останні 50 (сортуємо за спаданням)
+        collection
+                .find(Filters.and(
+                        Filters.eq("chatId", chatId),
+                        Filters.eq("deleted", false)
+                ))
+                .sort(Sorts.descending("sentAt"))
+                .limit(HISTORY_LIMIT)
+                .forEach(doc -> messages.add(docToMessage(doc)));
+        // Реверсуємо, щоб історія йшла від старіших до новіших
+        java.util.Collections.reverse(messages);
+        return messages;
+    }
+
+    public void markDeleted(String messageId) {
+        collection.updateOne(
+                Filters.eq("_id", new ObjectId(messageId)),
+                Updates.set("deleted", true)
+        );
+    }
+
+    // --- НОВІ МЕТОДИ ЗГІДНО З ТЗ ---
+
+    // Пошук повідомлення за його ID (використовує ваш існуючий мапінг)
+    public Message findById(String id) {
+        try {
+            Document doc = collection.find(Filters.eq("_id", new ObjectId(id))).first();
+            if (doc == null) return null;
+            return docToMessage(doc); // Використовуємо ваш метод для правильного створення об'єкта
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    // Оновлення тексту повідомлення з додаванням прапорця edited
+    public void updateContent(String messageId, String newText) {
+        collection.updateOne(
+                Filters.eq("_id", new ObjectId(messageId)),
+                Updates.combine(
+                        Updates.set("encryptedContent", newText), // Використовуємо ВАШУ назву поля
+                        Updates.set("edited", true)
+                )
+        );
+    }
+
+    // Повне видалення повідомлення з бази даних
+    public void deleteById(String messageId) {
+        collection.deleteOne(Filters.eq("_id", new ObjectId(messageId)));
+    }
+
+    // --- ДОПОМІЖНІ МЕТОДИ ---
+
+    private Message docToMessage(Document doc) {
+        Message msg = new Message();
+        msg.setId(doc.getObjectId("_id").toHexString());
+        msg.setChatId(doc.getString("chatId"));
+        msg.setSenderLogin(doc.getString("senderLogin"));
+        msg.setEncryptedContent(doc.getString("encryptedContent"));
+        msg.setSentAt(Instant.ofEpochMilli(doc.getLong("sentAt")));
+        msg.setDeleted(Boolean.TRUE.equals(doc.getBoolean("deleted")));
+
+        // Якщо у вашій моделі Message є поле edited та setter для нього,
+        // можете розкоментувати наступні рядки:
+        // if (doc.containsKey("edited")) {
+        //     msg.setEdited(doc.getBoolean("edited"));
+        // }
+
+        return msg;
+    }
+}package org.example.db;
+
+import org.example.models.Role; // Додано імпорт Role
+import org.example.models.User;
+import org.example.shared.security.PasswordUtil;
+
+public class AdminSeeder {
+
+    public static void main(String[] args) {
+        String adminLogin    = "admin";
+        String adminPassword = "Admin1234!";
+
+        UserRepository userRepo = new UserRepository();
+
+        // Виправлено назву методу на exists()
+        if (userRepo.exists(adminLogin)) {
+            System.out.println("[Seeder] Admin '" + adminLogin + "' already exists — skipping.");
+            MongoDBConnection.close();
+            return;
+        }
+
+        String hash = PasswordUtil.hash(adminPassword);
+
+        // Виправлено User.Role.ADMIN на Role.ADMIN
+        User admin = new User(adminLogin, hash, Role.ADMIN);
+        userRepo.save(admin);
+
+        System.out.println("[Seeder] Admin account created:");
+        System.out.println("         login:    " + adminLogin);
+        System.out.println("         password: " + adminPassword);
+        System.out.println("         role:     ADMIN");
+
+        // Тепер виклик getId() спрацює після оновлення моделі
+        System.out.println("         id:       " + admin.getId());
+
+        MongoDBConnection.close();
+    }
+}package org.example.db;
+
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
+import static com.mongodb.client.model.Updates.pull;
+import org.bson.Document;
+import org.example.models.Chat;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class ChatRepository {
+
+    private final MongoCollection<Document> collection;
+
+    // Ваш оригінальний конструктор, який правильно підключається до бази
+    public ChatRepository() {
+        MongoDatabase db = MongoDBConnection.getDatabase();
+        this.collection = db.getCollection("chats");
+    }
+
+    // --- ВАШІ ОРИГІНАЛЬНІ МЕТОДИ ---
+
+    public void save(Chat chat) {
+        Document doc = new Document()
+                .append("type", chat.getType().name())
+                .append("name", chat.getName())
+                .append("memberLogins", chat.getMemberLogins());
+        collection.insertOne(doc);
+        chat.setId(doc.getObjectId("_id").toHexString());
+    }
+
+    public Chat findById(String chatId) {
+        Document doc = collection.find(
+                Filters.eq("_id", new org.bson.types.ObjectId(chatId))
+        ).first();
+        return doc != null ? docToChat(doc) : null;
+    }
+
+    public List<Chat> findByMember(String login) {
+        List<Chat> chats = new ArrayList<>();
+        collection
+                .find(Filters.in("memberLogins", login))
+                .forEach(doc -> chats.add(docToChat(doc)));
+        return chats;
+    }
+
+    public Chat findPrivateChat(String loginA, String loginB) {
+        return collection
+                .find(Filters.and(
+                        Filters.eq("type", Chat.Type.PRIVATE.name()),
+                        Filters.all("memberLogins", loginA, loginB)
+                ))
+                .map(this::docToChat)
+                .first();
+    }
+
+    // --- НОВІ МЕТОДИ ЗГІДНО З ТЗ ---
+
+    // Каскадне видалення зі списків учасників усіх активних чатів
+    public void removeMemberFromAllChats(String username) {
+        // Використовуємо "memberLogins", оскільки це ваша назва поля у БД
+        collection.updateMany(
+                new Document(),
+                pull("memberLogins", username)
+        );
+    }
+
+    // Створення нового чату
+    public String createNewChat(String chatName, List<String> participants) {
+        Document newChat = new Document()
+                .append("type", "GROUP") // Вказуємо тип чату
+                .append("name", chatName)
+                .append("memberLogins", participants) // Використовуємо вашу назву масиву
+                .append("createdAt", System.currentTimeMillis());
+
+        collection.insertOne(newChat);
+
+        // Повертаємо згенерований MongoDB ідентифікатор чату як String
+        return newChat.getObjectId("_id").toHexString();
+    }
+
+    // --- ДОПОМІЖНІ МЕТОДИ ---
+
+    private Chat docToChat(Document doc) {
+        Chat chat = new Chat();
+        chat.setId(doc.getObjectId("_id").toHexString());
+        chat.setType(Chat.Type.valueOf(doc.getString("type")));
+        chat.setName(doc.getString("name"));
+        chat.setMemberLogins(doc.getList("memberLogins", String.class));
+        return chat;
+    }
+}package org.example.db;
+
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.Updates;
+import org.bson.Document;
+import org.example.models.Role;
+import org.example.models.User;
+import org.example.models.UserStatus;
+
+public class UserRepository {
+
+    private final MongoCollection<Document> collection;
+
+    // Правильний конструктор, який підключається до вашої бази
+    public UserRepository() {
+        MongoDatabase db = MongoDBConnection.getDatabase();
+        this.collection = db.getCollection("users");
+    }
+
+    // --- ВАШІ БАЗОВІ МЕТОДИ ---
+
+    public boolean exists(String login) {
+        return collection.find(Filters.eq("login", login)).first() != null;
+    }
+
+    public void save(User user) {
+        Document doc = new Document("login", user.getLogin())
+                .append("passwordHash", user.getPasswordHash())
+                .append("role", user.getRole().name())
+                .append("status", user.getStatus() != null ? user.getStatus().name() : UserStatus.ACTIVE.name())
+                .append("isOnline", false);
+        collection.insertOne(doc);
+    }
+
+    public User findByLogin(String login) {
+        Document doc = collection.find(Filters.eq("login", login)).first();
+        if (doc == null) return null;
+
+        User user = new User(
+                doc.getString("login"),
+                doc.getString("passwordHash"),
+                Role.valueOf(doc.getString("role"))
+        );
+
+        if (doc.containsKey("status")) {
+            user.setStatus(UserStatus.valueOf(doc.getString("status")));
+        }
+        return user;
+    }
+
+    // --- НОВІ МЕТОДИ ЗГІДНО З ТЗ ---
+
+    // Переведення статусу користувача в OFFLINE/ONLINE у БД
+    public void updateOnlineStatus(String login, boolean isOnline) {
+        collection.updateOne(
+                Filters.eq("login", login),
+                Updates.set("isOnline", isOnline)
+        );
+    }
+
+    // Оновлення статусу користувача (наприклад, для бану)
+    public void updateStatus(String login, UserStatus status) {
+        collection.updateOne(
+                Filters.eq("login", login),
+                Updates.set("status", status.name())
+        );
+    }
+
+    // Повне видалення користувача з бази (для команди адміна DELETE_USER)
+    public void deleteByLogin(String login) {
+        collection.deleteOne(Filters.eq("login", login));
+    }
+}package org.example.db;
+
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.github.cdimascio.dotenv.Dotenv;
+
+/**
+ * Єдина точка підключення до MongoDB.
+ *
+ * URI бази береться (у порядку пріоритету):
+ *   1. .env файл
+ *   2. JVM system property -DMONGO_URI=...
+ *   3. Змінна середовища MONGO_URI
+ *   4. Локальний MongoDB за замовчуванням (mongodb://localhost:27017)
+ *
+ * Для MongoDB Atlas задайте рядок підключення з вашого кластера, наприклад:
+ *   mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=true&w=majority
+ *
+ * Назву бази даних також можна перевизначити через MONGO_DB_NAME,
+ * інакше використовується "asap_messenger".
+ */
+public class MongoDBConnection {
+
+    private static final String DEFAULT_URI = "mongodb://localhost:27017";
+    private static final String DEFAULT_DB_NAME = "asap_messenger";
+
+    private static MongoClient mongoClient;
+    private static MongoDatabase database;
+
+    public static MongoDatabase getDatabase() {
+        if (mongoClient == null) {
+            Dotenv.configure().ignoreIfMissing().systemProperties().load();
+            String uri = resolveUri();
+            String dbName = resolveDbName();
+            mongoClient = MongoClients.create(uri);
+            database = mongoClient.getDatabase(dbName);
+            System.out.println("[Mongo] Підключено до бази: " + dbName);
+        }
+        return database;
+    }
+
+    private static String resolveUri() {
+        String fromProp = System.getProperty("MONGO_URI");
+        if (fromProp != null && !fromProp.isBlank()) return fromProp;
+
+        String fromEnv = System.getenv("MONGO_URI");
+        if (fromEnv != null && !fromEnv.isBlank()) return fromEnv;
+
+        return DEFAULT_URI;
+    }
+
+    private static String resolveDbName() {
+        String fromProp = System.getProperty("MONGO_DB_NAME");
+        if (fromProp != null && !fromProp.isBlank()) return fromProp;
+
+        String fromEnv = System.getenv("MONGO_DB_NAME");
+        if (fromEnv != null && !fromEnv.isBlank()) return fromEnv;
+
+        return DEFAULT_DB_NAME;
+    }
+
+    public static void close() {
+        if (mongoClient != null) {
+            mongoClient.close();
+            mongoClient = null;
+            database = null;
+        }
+    }
+}
+package org.example.client;
+
+import org.example.client.network.ServerConnection;
+import org.example.shared.protocol.Packet;
+import org.example.shared.protocol.PacketType;
+import org.example.shared.protocol.PayloadBuilder;
+
+import java.util.Scanner;
+
+public class TestClient {
+
+    private static ServerConnection connection;
+    private static String currentLogin;
+
+    public static void main(String[] args) throws Exception {
+        connection = new ServerConnection();
+        connection.connect(TestClient::onPacket, TestClient::onDisconnect);
+        System.out.println("[TestClient] Connected to server on localhost:8080");
+        printHelp();
+
+        Scanner scanner = new Scanner(System.in);
+        while (scanner.hasNextLine()) {
+            String line = scanner.nextLine().trim();
+            if (line.isEmpty()) continue;
+            handleCommand(line);
+        }
+    }
+
+    private static void handleCommand(String line) throws Exception {
+        String[] parts = line.split(" ", 3);
+        String cmd = parts[0].toLowerCase();
+
+        switch (cmd) {
+            case "register" -> {
+                if (parts.length < 3) { System.out.println("Usage: register <login> <password>"); return; }
+                Packet p = new Packet(PacketType.REGISTER_REQUEST,
+                        new PayloadBuilder().add("login", parts[1]).add("password", parts[2]).build());
+                connection.send(p);
+            }
+            case "login" -> {
+                if (parts.length < 3) { System.out.println("Usage: login <login> <password>"); return; }
+                currentLogin = parts[1];
+                Packet p = new Packet(PacketType.LOGIN_REQUEST,
+                        new PayloadBuilder().add("login", parts[1]).add("password", parts[2]).build());
+                connection.send(p);
+            }
+            case "msg" -> {
+                if (parts.length < 3) { System.out.println("Usage: msg <chatId> <text>"); return; }
+                Packet p = new Packet(PacketType.SEND_MSG,
+                        new PayloadBuilder().add("chatId", parts[1]).add("content", parts[2]).build());
+                connection.send(p);
+            }
+            case "history" -> {
+                if (parts.length < 2) { System.out.println("Usage: history <chatId>"); return; }
+                Packet p = new Packet(PacketType.GET_HISTORY,
+                        new PayloadBuilder().add("chatId", parts[1]).build());
+                connection.send(p);
+            }
+            // Виправлено: прибрані зайві фігурні дужки
+            case "contacts" -> connection.send(new Packet(PacketType.GET_CONTACTS, new PayloadBuilder().build()));
+            case "chat" -> {
+                if (parts.length < 3) { System.out.println("Usage: chat <otherLogin> private|group"); return; }
+                String type = parts[2].equalsIgnoreCase("group") ? "GROUP" : "PRIVATE";
+                Packet p = new Packet(PacketType.CREATE_CHAT,
+                        new PayloadBuilder()
+                                .add("type", type)
+                                .add("name", "Chat with " + parts[1])
+                                .add("members", currentLogin + "," + parts[1])
+                                .build());
+                connection.send(p);
+            }
+            case "ban" -> {
+                if (parts.length < 2) { System.out.println("Usage: ban <login>"); return; }
+                Packet p = new Packet(PacketType.ADMIN_ACTION,
+                        new PayloadBuilder().add("action", "BAN_USER").add("target", parts[1]).build());
+                connection.send(p);
+            }
+            case "stats" -> {
+                Packet p = new Packet(PacketType.ADMIN_ACTION,
+                        new PayloadBuilder().add("action", "SERVER_STATS").add("target", "").build());
+                connection.send(p);
+            }
+            // Виправлено: прибрані зайві фігурні дужки
+            case "ping" -> connection.send(new Packet(PacketType.PING, new byte[0]));
+            case "help" -> printHelp();
+            case "quit", "exit" -> {
+                connection.disconnect();
+                System.out.println("[TestClient] Disconnected.");
+                System.exit(0);
+            }
+            default -> System.out.println("[TestClient] Unknown command. Type 'help' for list.");
+        }
+    }
+
+    private static void onPacket(Packet packet) {
+        System.out.println("\n[SERVER → " + packet.getType() + "]");
+        if (packet.getPayload() != null && packet.getPayload().length > 0) {
+            System.out.println("  " + new String(packet.getPayload()));
+        }
+        System.out.print("> ");
+    }
+
+    private static void onDisconnect() {
+        System.out.println("[TestClient] Server disconnected.");
+        System.exit(0);
+    }
+
+    private static void printHelp() {
+        System.out.println("""
+                
+                ╔══════════════════════════════════════════╗
+                ║         ASAP TestClient — команди        ║
+                ╠══════════════════════════════════════════╣
+                ║ register <login> <password>              ║
+                ║ login <login> <password>                 ║
+                ║ contacts                                 ║
+                ║ chat <otherLogin> private|group          ║
+                ║ msg <chatId> <text>                      ║
+                ║ history <chatId>                         ║
+                ║ ban <login>           (тільки адмін)     ║
+                ║ stats                 (тільки адмін)     ║
+                ║ ping                                     ║
+                ║ quit                                     ║
+                ╚══════════════════════════════════════════╝
+                """);
+        System.out.print("> ");
+    }
+}package org.example.client.network;
+
+import org.example.shared.protocol.Packet;
+import org.example.shared.protocol.PacketType;
+import org.example.shared.security.AesUtil;
+
+import javax.crypto.SecretKey;
+import java.io.DataInputStream;
+import java.io.EOFException;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.function.Consumer;
+
+/**
+ * ВИПРАВЛЕНО:
+ * 1. Читає пакети у int-code форматі (відповідає ClientHandler і PacketIO).
+ * 2. Дешифрує payload через AES після handshake.
+ * 3. Передає конструктору DataInputStream та AES-ключ (не відкриває stream заново).
+ */
+public class NetworkListener implements Runnable {
+
+    private final Socket socket;
+    private final DataInputStream in;
+    private final SecretKey aesSessionKey;
+    private final Consumer<Packet> onPacket;
+    private final Runnable onDisconnect;
+
+    public NetworkListener(Socket socket,
+                           DataInputStream in,
+                           SecretKey aesSessionKey,
+                           Consumer<Packet> onPacket,
+                           Runnable onDisconnect) {
+        this.socket        = socket;
+        this.in            = in;
+        this.aesSessionKey = aesSessionKey;
+        this.onPacket      = onPacket;
+        this.onDisconnect  = onDisconnect;
+    }
+
+    @Override
+    public void run() {
+        try {
+            while (!socket.isClosed()) {
+                int typeCode   = in.readInt();
+                int payloadLen = in.readInt();
+
+                byte[] rawPayload = new byte[payloadLen];
+                if (payloadLen > 0) in.readFully(rawPayload);
+
+                PacketType type = PacketType.fromCode(typeCode);
+
+                // Дешифруємо payload через AES
+                byte[] decryptedPayload;
+                if (aesSessionKey != null
+                        && type != PacketType.KEY_EXCHANGE_INIT
+                        && type != PacketType.KEY_EXCHANGE_RESP) {
+                    try {
+                        String encrypted = new String(rawPayload, StandardCharsets.UTF_8);
+                        String decrypted = AesUtil.decrypt(encrypted, aesSessionKey);
+                        decryptedPayload = decrypted.getBytes(StandardCharsets.UTF_8);
+                    } catch (Exception e) {
+                        // Якщо дешифрування не вдалося — передаємо як є
+                        decryptedPayload = rawPayload;
+                    }
+                } else {
+                    decryptedPayload = rawPayload;
+                }
+
+                onPacket.accept(new Packet(type, decryptedPayload));
+            }
+        } catch (EOFException ignored) {
+            // Сервер закрив з'єднання
+        } catch (Exception e) {
+            if (!socket.isClosed()) {
+                System.err.println("[NetworkListener] Помилка: " + e.getMessage());
+            }
+        } finally {
+            onDisconnect.run();
+        }
+    }
+}package org.example.client.network;
+
+import org.example.shared.protocol.Packet;
+import org.example.shared.protocol.PacketType;
+import org.example.shared.security.AesUtil;
+import org.example.shared.security.RsaUtil;
+
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.PublicKey;
+import java.util.function.Consumer;
+
+/**
+ * ВИПРАВЛЕНО:
+ * 1. Протокол читання/запису приведений до int-code формату (збігається з ClientHandler).
+ * 2. Виконується RSA/AES handshake при підключенні — клієнт генерує AES-ключ,
+ *    шифрує його RSA публічним ключем сервера і відправляє назад.
+ * 3. Всі наступні пакети шифруються/дешифруються через AES.
+ */
+public class ServerConnection {
+
+    private static final String HOST = "localhost";
+    private static final int PORT = 8080;
+
+    private Socket socket;
+    private DataInputStream in;
+    private DataOutputStream out;
+
+    private SecretKey aesSessionKey;
+    private boolean handshakeComplete = false;
+
+    public void connect(Consumer<Packet> onPacket, Runnable onDisconnect) throws Exception {
+        socket = new Socket(HOST, PORT);
+        in = new DataInputStream(socket.getInputStream());
+        out = new DataOutputStream(socket.getOutputStream());
+
+        performHandshake();
+
+        NetworkListener listener = new NetworkListener(socket, in, aesSessionKey, onPacket, onDisconnect);
+        Thread listenerThread = new Thread(listener, "network-listener");
+        listenerThread.setDaemon(true);
+        listenerThread.start();
+    }
+
+    /**
+     * Крок 1: Читаємо RSA публічний ключ від сервера.
+     * Крок 2: Генеруємо AES-ключ, шифруємо RSA, надсилаємо серверу.
+     */
+    private void performHandshake() throws Exception {
+        // Читаємо KEY_EXCHANGE_INIT
+        int typeCode = in.readInt(); // тип пакета (ми його не використовуємо)
+        int keyLen = in.readInt();
+        byte[] publicKeyBytes = new byte[keyLen];
+        in.readFully(publicKeyBytes);
+
+        PublicKey serverPublicKey = RsaUtil.publicKeyFromBytes(publicKeyBytes);
+
+        // Генеруємо AES-ключ
+        KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+        keyGen.init(256);
+        aesSessionKey = keyGen.generateKey();
+        byte[] aesKeyBytes = aesSessionKey.getEncoded();
+
+        // Шифруємо AES-ключ RSA публічним ключем сервера
+        byte[] encryptedAesKey = RsaUtil.encryptWithPublicKey(aesKeyBytes, serverPublicKey);
+
+        // Відправляємо KEY_EXCHANGE_RESP
+        out.writeInt(PacketType.KEY_EXCHANGE_RESP.getCode());
+        out.writeInt(encryptedAesKey.length);
+        out.write(encryptedAesKey);
+        out.flush();
+
+        handshakeComplete = true;
+    }
+
+    /**
+     * Надсилає пакет з AES-шифруванням payload (int-code протокол).
+     */
+    public synchronized void send(Packet packet) throws Exception {
+        byte[] rawPayload = packet.getPayload() != null ? packet.getPayload() : new byte[0];
+
+        byte[] payloadToSend;
+        if (handshakeComplete
+                && packet.getType() != PacketType.KEY_EXCHANGE_INIT
+                && packet.getType() != PacketType.KEY_EXCHANGE_RESP) {
+            String plain = new String(rawPayload, StandardCharsets.UTF_8);
+            String encrypted = AesUtil.encrypt(plain, aesSessionKey);
+            payloadToSend = encrypted.getBytes(StandardCharsets.UTF_8);
+        } else {
+            payloadToSend = rawPayload;
+        }
+
+        out.writeInt(packet.getType().getCode());
+        out.writeInt(payloadToSend.length);
+        if (payloadToSend.length > 0) out.write(payloadToSend);
+        out.flush();
+    }
+
+    public void disconnect() {
+        try {
+            if (socket != null) socket.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    @SuppressWarnings("unused")
+    public boolean isConnected() {
+        return socket != null && !socket.isClosed();
+    }
+}package org.example.gateway;
+
+import java.io.*;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Веб-шлюз (WebGateway).
+ *
+ * Не підмінює ASAP-протокол і не замінює org.example.server.network.Server —
+ * це окремий, тонкий процес, який:
+ *   1. Роздає браузеру статичні файли клієнта (HTML/CSS/JS) з каталогу webapp/.
+ *   2. Приймає WebSocket-з'єднання на шляху /ws і для кожного з них відкриває
+ *      власне TCP-з'єднання до основного ASAP Server (порт 8080), перекладаючи
+ *      JSON ↔ кастомні Packet (див. ClientSessionBridge).
+ *
+ * Запускати після того, як основний Server вже працює на порту 8080.
+ */
+public class WebGateway {
+
+    private static final int HTTP_PORT = 8081;
+    private static final String WEBAPP_DIR = "webapp";
+
+    public static void main(String[] args) throws IOException {
+        int port = HTTP_PORT;
+        if (args.length > 0) {
+            try {
+                port = Integer.parseInt(args[0]);
+            } catch (NumberFormatException ignored) {}
+        }
+
+        ExecutorService pool = Executors.newCachedThreadPool();
+
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            System.out.println("[WebGateway] Запущено на http://localhost:" + port);
+            System.out.println("[WebGateway] Очікую підключення ASAP Server на localhost:8080 ...");
+
+            while (true) {
+                Socket socket = serverSocket.accept();
+                pool.execute(() -> handleConnection(socket));
+            }
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    private static void handleConnection(Socket socket) {
+        try {
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+
+            String requestLine = reader.readLine();
+            if (requestLine == null || requestLine.isBlank()) {
+                socket.close();
+                return;
+            }
+
+            String[] requestParts = requestLine.split(" ");
+            String method = requestParts[0];
+            String path = requestParts.length > 1 ? requestParts[1] : "/";
+
+            String webSocketKey = null;
+            boolean isUpgrade = false;
+            String line;
+            while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                String lower = line.toLowerCase();
+                if (lower.startsWith("upgrade:") && lower.contains("websocket")) {
+                    isUpgrade = true;
+                } else if (lower.startsWith("sec-websocket-key:")) {
+                    webSocketKey = line.substring(line.indexOf(':') + 1).trim();
+                }
+            }
+
+            if (isUpgrade && webSocketKey != null && path.equals("/ws")) {
+                WebSocketConnection ws = WebSocketConnection.upgrade(socket, webSocketKey);
+                new ClientSessionBridge(ws).start();
+                return;
+            }
+
+            if ("GET".equals(method)) {
+                serveStaticFile(socket, path);
+            } else {
+                writeSimpleResponse(socket, 405, "text/plain", "Method Not Allowed");
+            }
+        } catch (Exception e) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {}
+        }
+    }
+
+    private static void serveStaticFile(Socket socket, String requestPath) throws IOException {
+        String decodedPath = URLDecoder.decode(requestPath, StandardCharsets.UTF_8);
+        if (decodedPath.equals("/")) decodedPath = "/login.html";
+
+        Path base = Path.of(WEBAPP_DIR).toAbsolutePath().normalize();
+        Path file = base.resolve(decodedPath.substring(1)).normalize();
+
+        if (!file.startsWith(base) || !Files.exists(file) || Files.isDirectory(file)) {
+            writeSimpleResponse(socket, 404, "text/plain", "Not found: " + decodedPath);
+            return;
+        }
+
+        byte[] content = Files.readAllBytes(file);
+        String contentType = guessContentType(file.toString());
+
+        OutputStream out = socket.getOutputStream();
+        String headers = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: " + contentType + "\r\n" +
+                "Content-Length: " + content.length + "\r\n" +
+                "Connection: close\r\n\r\n";
+        out.write(headers.getBytes(StandardCharsets.UTF_8));
+        out.write(content);
+        out.flush();
+        socket.close();
+    }
+
+    private static String guessContentType(String fileName) {
+        if (fileName.endsWith(".html")) return "text/html; charset=utf-8";
+        if (fileName.endsWith(".css")) return "text/css; charset=utf-8";
+        if (fileName.endsWith(".js")) return "application/javascript; charset=utf-8";
+        if (fileName.endsWith(".png")) return "image/png";
+        if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg")) return "image/jpeg";
+        if (fileName.endsWith(".svg")) return "image/svg+xml";
+        return "application/octet-stream";
+    }
+
+    private static void writeSimpleResponse(Socket socket, int code, String contentType, String body) {
+        try {
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            String headers = "HTTP/1.1 " + code + " " + statusText(code) + "\r\n" +
+                    "Content-Type: " + contentType + "\r\n" +
+                    "Content-Length: " + bytes.length + "\r\n" +
+                    "Connection: close\r\n\r\n";
+            OutputStream out = socket.getOutputStream();
+            out.write(headers.getBytes(StandardCharsets.UTF_8));
+            out.write(bytes);
+            out.flush();
+            socket.close();
+        } catch (IOException ignored) {}
+    }
+
+    private static String statusText(int code) {
+        return switch (code) {
+            case 404 -> "Not Found";
+            case 405 -> "Method Not Allowed";
+            default -> "Error";
+        };
+    }
+}
+package org.example.gateway;
+
+import java.io.*;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.function.Consumer;
+
+/**
+ * Мінімальна реалізація сервера WebSocket (RFC 6455) "з нуля",
+ * без зовнішніх бібліотек — достатньо для обміну текстовими (JSON) фреймами
+ * між браузером і WebGateway.
+ *
+ * Підтримує лише те, що потрібно цьому проєкту:
+ *  - один HTTP Upgrade handshake;
+ *  - текстові фрейми (opcode 0x1) від клієнта до сервера (завжди маскуються браузером);
+ *  - текстові фрейми від сервера до клієнта (без маски);
+ *  - close-фрейм (opcode 0x8) для коректного завершення з'єднання.
+ */
+public class WebSocketConnection {
+
+    private static final String WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+    private final Socket socket;
+    private final InputStream in;
+    private final OutputStream out;
+
+    private WebSocketConnection(Socket socket, InputStream in, OutputStream out) {
+        this.socket = socket;
+        this.in = in;
+        this.out = out;
+    }
+
+    /**
+     * Виконує WebSocket handshake над уже прийнятим HTTP GET запитом.
+     * requestHeaders — заголовки, які вже зчитав HTTP-шар (потрібен лише Sec-WebSocket-Key).
+     */
+    public static WebSocketConnection upgrade(Socket socket, String secWebSocketKey) throws IOException {
+        OutputStream out = socket.getOutputStream();
+        String acceptKey = computeAcceptKey(secWebSocketKey);
+
+        String response = "HTTP/1.1 101 Switching Protocols\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
+
+        out.write(response.getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+
+        return new WebSocketConnection(socket, socket.getInputStream(), out);
+    }
+
+    private static String computeAcceptKey(String key) {
+        try {
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+            byte[] hash = sha1.digest((key + WS_MAGIC).getBytes(StandardCharsets.UTF_8));
+            return Base64.getEncoder().encodeToString(hash);
+        } catch (Exception e) {
+            throw new RuntimeException("SHA-1 unavailable", e);
+        }
+    }
+
+    /** Блокуюче читання фреймів у циклі. Кличе onText для кожного текстового повідомлення. */
+    public void listen(Consumer<String> onText, Runnable onClose) {
+        try {
+            while (true) {
+                Frame frame = readFrame();
+                if (frame == null) break;
+
+                if (frame.opcode == 0x8) {
+                    break;
+                } else if (frame.opcode == 0x1) {
+                    onText.accept(new String(frame.payload, StandardCharsets.UTF_8));
+                } else if (frame.opcode == 0x9) {
+                    sendFrame(0xA, frame.payload);
+                }
+            }
+        } catch (IOException ignored) {
+            // з'єднання закрито клієнтом
+        } finally {
+            onClose.run();
+            closeQuietly();
+        }
+    }
+
+    public synchronized void sendText(String text) {
+        try {
+            sendFrame(0x1, text.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+            closeQuietly();
+        }
+    }
+
+    private void sendFrame(int opcode, byte[] payload) throws IOException {
+        out.write(0x80 | opcode);
+
+        int len = payload.length;
+        if (len <= 125) {
+            out.write(len);
+        } else if (len <= 65535) {
+            out.write(126);
+            out.write((len >> 8) & 0xFF);
+            out.write(len & 0xFF);
+        } else {
+            out.write(127);
+            for (int i = 7; i >= 0; i--) {
+                out.write((int) ((((long) len) >> (8 * i)) & 0xFF));
+            }
+        }
+        out.write(payload);
+        out.flush();
+    }
+
+    private Frame readFrame() throws IOException {
+        int b1 = in.read();
+        if (b1 == -1) return null;
+        int b2 = in.read();
+        if (b2 == -1) return null;
+
+        boolean fin = (b1 & 0x80) != 0;
+        int opcode = b1 & 0x0F;
+        boolean masked = (b2 & 0x80) != 0;
+        long len = b2 & 0x7F;
+
+        if (len == 126) {
+            len = ((readByte() & 0xFF) << 8) | (readByte() & 0xFF);
+        } else if (len == 127) {
+            len = 0;
+            for (int i = 0; i < 8; i++) {
+                len = (len << 8) | (readByte() & 0xFF);
+            }
+        }
+
+        byte[] mask = new byte[4];
+        if (masked) {
+            readFully(mask);
+        }
+
+        byte[] payload = new byte[(int) len];
+        readFully(payload);
+
+        if (masked) {
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] ^= mask[i % 4];
+            }
+        }
+
+        Frame frame = new Frame();
+        frame.opcode = opcode;
+        frame.payload = payload;
+        return frame;
+    }
+
+    private int readByte() throws IOException {
+        int b = in.read();
+        if (b == -1) throw new EOFException("WebSocket stream closed");
+        return b;
+    }
+
+    private void readFully(byte[] buf) throws IOException {
+        int offset = 0;
+        while (offset < buf.length) {
+            int read = in.read(buf, offset, buf.length - offset);
+            if (read == -1) throw new EOFException("WebSocket stream closed");
+            offset += read;
+        }
+    }
+
+    private void closeQuietly() {
+        try {
+            socket.close();
+        } catch (IOException ignored) {}
+    }
+
+    private static class Frame {
+        int opcode;
+        byte[] payload;
+    }
+}
+package org.example.gateway;
+
+import org.example.client.network.ServerConnection;
+import org.example.shared.protocol.Packet;
+import org.example.shared.protocol.PacketType;
+import org.example.shared.protocol.PayloadBuilder;
+
+import java.util.Map;
+
+/**
+ * Місток "один браузерний клієнт ↔ одне TCP-з'єднання до ASAP Server".
+ *
+ * Кожне нове WebSocket-з'єднання від браузера створює власний
+ * ServerConnection (так само, як це робить консольний TestClient) і
+ * відкриває окреме TCP-з'єднання до org.example.server.network.Server.
+ * Це навмисне рішення: gateway нічого не підмінює у протоколі — він лише
+ * перекладає JSON (зручний для JS) у бінарні Packet/PacketType, якими вже
+ * оперує сервер, і навпаки.
+ */
+public class ClientSessionBridge {
+
+    private final WebSocketConnection ws;
+    private final ServerConnection serverConnection = new ServerConnection();
+
+    public ClientSessionBridge(WebSocketConnection ws) {
+        this.ws = ws;
+    }
+
+    public void start() {
+        try {
+            serverConnection.connect(this::onPacketFromServer, this::onServerDisconnect);
+        } catch (Exception e) {
+            ws.sendText(SimpleJson.toJson(Map.of(
+                    "type", "ERROR",
+                    "reason", "Не вдалося з'єднатися з ASAP Server: " + e.getMessage()
+            )));
+            return;
+        }
+
+        ws.listen(this::onMessageFromBrowser, this::onBrowserDisconnect);
+    }
+
+    private void onMessageFromBrowser(String json) {
+        try {
+            Map<String, String> data = SimpleJson.parse(json);
+            String typeName = data.get("type");
+            if (typeName == null) return;
+
+            PacketType type = PacketType.valueOf(typeName);
+
+            PayloadBuilder builder = new PayloadBuilder();
+            for (Map.Entry<String, String> e : data.entrySet()) {
+                if (!e.getKey().equals("type")) {
+                    builder.add(e.getKey(), e.getValue());
+                }
+            }
+
+            serverConnection.send(new Packet(type, builder.build()));
+        } catch (Exception e) {
+            ws.sendText(SimpleJson.toJson(Map.of(
+                    "type", "ERROR",
+                    "reason", "Некоректне повідомлення від клієнта: " + e.getMessage()
+            )));
+        }
+    }
+
+    private void onPacketFromServer(Packet packet) {
+        Map<String, String> fields = PayloadBuilder.parse(packet.getPayload());
+        Map<String, String> out = new java.util.LinkedHashMap<>(fields);
+        out.put("type", packet.getType().name());
+        ws.sendText(SimpleJson.toJson(out));
+    }
+
+    private void onServerDisconnect() {
+        ws.sendText(SimpleJson.toJson(Map.of(
+                "type", "ERROR",
+                "reason", "Зв'язок з ASAP Server втрачено"
+        )));
+    }
+
+    private void onBrowserDisconnect() {
+        serverConnection.disconnect();
+    }
+}
+package org.example.gateway;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Дуже простий JSON-кодек для плоских об'єктів {"key":"value", ...}.
+ *
+ * Навмисно не використовує жодної зовнішньої бібліотеки — браузерний клієнт
+ * і так працює лише з плоскими полями (login, password, chatId, content...),
+ * тож повноцінний JSON-парсер тут надлишковий. Формат сумісний з тим, який
+ * вже генерує org.example.shared.protocol.PayloadBuilder на боці сервера.
+ */
+public class SimpleJson {
+
+    public static Map<String, String> parse(String json) {
+        Map<String, String> map = new LinkedHashMap<>();
+        if (json == null) return map;
+
+        String body = json.trim();
+        if (body.startsWith("{")) body = body.substring(1);
+        if (body.endsWith("}")) body = body.substring(0, body.length() - 1);
+        if (body.isBlank()) return map;
+
+        for (String pair : splitTopLevel(body)) {
+            int sep = findKeyValueSeparator(pair);
+            if (sep < 0) continue;
+            String rawKey = pair.substring(0, sep).trim();
+            String rawVal = pair.substring(sep + 1).trim();
+            map.put(unquote(rawKey), unquote(rawVal));
+        }
+        return map;
+    }
+
+    public static String toJson(Map<String, String> fields) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> e : fields.entrySet()) {
+            if (!first) sb.append(",");
+            sb.append("\"").append(escape(e.getKey())).append("\":");
+            sb.append("\"").append(escape(e.getValue() == null ? "" : e.getValue())).append("\"");
+            first = false;
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private static java.util.List<String> splitTopLevel(String body) {
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        int depth = 0;
+        boolean inQuotes = false;
+        StringBuilder current = new StringBuilder();
+
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '"' && (i == 0 || body.charAt(i - 1) != '\\')) {
+                inQuotes = !inQuotes;
+            }
+            if (!inQuotes) {
+                if (c == '{' || c == '[') depth++;
+                if (c == '}' || c == ']') depth--;
+            }
+            if (c == ',' && depth == 0 && !inQuotes) {
+                parts.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        if (!current.isEmpty()) parts.add(current.toString());
+        return parts;
+    }
+
+    private static int findKeyValueSeparator(String pair) {
+        boolean inQuotes = false;
+        for (int i = 0; i < pair.length(); i++) {
+            char c = pair.charAt(i);
+            if (c == '"' && (i == 0 || pair.charAt(i - 1) != '\\')) {
+                inQuotes = !inQuotes;
+            }
+            if (c == ':' && !inQuotes) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String unquote(String s) {
+        String t = s.trim();
+        if (t.length() >= 2 && t.startsWith("\"") && t.endsWith("\"")) {
+            t = t.substring(1, t.length() - 1);
+        }
+        return t.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+
+    private static String escape(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+}

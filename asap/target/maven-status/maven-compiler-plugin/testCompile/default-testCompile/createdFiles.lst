@@ -1,0 +1,5 @@
+org/example/PayloadBuilderTest.class
+org/example/AesUtilTest.class
+org/example/SimpleJsonTest.class
+org/example/PasswordUtilTest.class
+org/example/SessionRegistryTest.class

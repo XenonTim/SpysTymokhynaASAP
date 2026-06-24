@@ -14,13 +14,10 @@ public class ChatRepository {
 
     private final MongoCollection<Document> collection;
 
-    // Ваш оригінальний конструктор, який правильно підключається до бази
     public ChatRepository() {
         MongoDatabase db = MongoDBConnection.getDatabase();
         this.collection = db.getCollection("chats");
     }
-
-    // --- ВАШІ ОРИГІНАЛЬНІ МЕТОДИ ---
 
     public void save(Chat chat) {
         Document doc = new Document()
@@ -56,32 +53,22 @@ public class ChatRepository {
                 .first();
     }
 
-    // --- НОВІ МЕТОДИ ЗГІДНО З ТЗ ---
-
-    // Каскадне видалення зі списків учасників усіх активних чатів
     public void removeMemberFromAllChats(String username) {
-        // Використовуємо "memberLogins", оскільки це ваша назва поля у БД
         collection.updateMany(
                 new Document(),
                 pull("memberLogins", username)
         );
     }
 
-    // Створення нового чату
-    public String createNewChat(String chatName, List<String> participants) {
+    public String createNewChat(String chatName, List<String> participants, Chat.Type type) {
         Document newChat = new Document()
-                .append("type", "GROUP") // Вказуємо тип чату
+                .append("type", type.name())
                 .append("name", chatName)
-                .append("memberLogins", participants) // Використовуємо вашу назву масиву
+                .append("memberLogins", participants)
                 .append("createdAt", System.currentTimeMillis());
-
         collection.insertOne(newChat);
-
-        // Повертаємо згенерований MongoDB ідентифікатор чату як String
         return newChat.getObjectId("_id").toHexString();
     }
-
-    // --- ДОПОМІЖНІ МЕТОДИ ---
 
     private Chat docToChat(Document doc) {
         Chat chat = new Chat();
