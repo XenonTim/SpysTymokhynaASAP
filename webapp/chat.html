@@ -177,11 +177,36 @@
     function renderMessages(chatId) {
       const pane = document.getElementById("messages-pane");
       pane.innerHTML = "";
-      (messagesByChat[chatId] || []).forEach((msg) => {
+      (messagesByChat[chatId] || []).forEach((msg, index) => {
         const bubble = document.createElement("div");
         bubble.className = "msg-bubble " + (msg.sender === myLogin ? "mine" : "theirs");
         const time = msg.sentAt ? new Date(Number(msg.sentAt)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-        bubble.innerHTML = `<div class="meta">${escapeHtml(msg.sender)} · ${time}</div><div>${escapeHtml(msg.text)}</div>`;
+
+        let actionsHtml = "";
+        if (msg.sender === myLogin) {
+          actionsHtml = `
+            <div class="msg-actions" style="margin-top: 4px; text-align: right; opacity: 0.6; transition: opacity 0.2s;">
+              <span title="Редагувати" style="cursor: pointer; margin-right: 10px; font-size: 13px;" onclick="editMessage('${chatId}', ${index})">✏️</span>
+              <span title="Видалити" style="cursor: pointer; font-size: 13px;" onclick="deleteMessage('${chatId}', ${index}, '${msg.id || ''}')">🗑️</span>
+            </div>
+          `;
+        }
+
+        bubble.innerHTML = `
+          <div class="meta">${escapeHtml(msg.sender)} · ${time}</div>
+          <div class="msg-text-content" style="word-break: break-word;">${escapeHtml(msg.text)}</div>
+          ${actionsHtml}
+        `;
+
+        bubble.addEventListener('mouseenter', () => {
+          const acts = bubble.querySelector('.msg-actions');
+          if (acts) acts.style.opacity = '1';
+        });
+        bubble.addEventListener('mouseleave', () => {
+          const acts = bubble.querySelector('.msg-actions');
+          if (acts) acts.style.opacity = '0.6';
+        });
+
         pane.appendChild(bubble);
       });
       pane.scrollTop = pane.scrollHeight;
@@ -377,6 +402,37 @@
     ASAPClient.connect().catch(() => {
       showToast("Не вдалося з'єднатися з WebGateway");
     });
+
+    window.editMessage = function(chatId, msgIndex) {
+      const msg = messagesByChat[chatId][msgIndex];
+      const newText = prompt("Редагувати повідомлення:", msg.text);
+      if (newText === null || newText.trim() === "") return;
+
+      msg.text = newText.trim();
+      renderMessages(chatId);
+
+      if (msg.id) {
+        ASAPClient.send("ADMIN_ACTION", {
+          action: "EDIT_MESSAGE",
+          messageId: msg.id,
+          target: encryptForWire(newText.trim())
+        });
+      }
+    };
+
+    window.deleteMessage = function(chatId, msgIndex, messageId) {
+      if (!confirm("Ви впевнені, що хочете видалити це повідомлення?")) return;
+
+      messagesByChat[chatId].splice(msgIndex, 1);
+      renderMessages(chatId);
+
+      if (messageId) {
+        ASAPClient.send("ADMIN_ACTION", {
+          action: "DELETE_MESSAGE",
+          messageId: messageId
+        });
+      }
+    };
   </script>
 </body>
 </html>
