@@ -10,6 +10,7 @@ import org.example.models.Message;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 
 public class MessageRepository {
@@ -52,6 +53,29 @@ public class MessageRepository {
                 Filters.eq("_id", new org.bson.types.ObjectId(messageId)),
                 Updates.set("deleted", true)
         );
+    }
+
+    public void updateMessageText(String messageId, String newContent) {
+        collection.updateOne(
+                Filters.eq("_id", new org.bson.types.ObjectId(messageId)),
+                Updates.set("encryptedContent", newContent)
+        );
+    }
+
+    public Message findById(String messageId) {
+        Document doc = collection.find(Filters.eq("_id", new org.bson.types.ObjectId(messageId))).first();
+        if (doc == null) return null;
+
+        Message msg = new Message();
+        msg.setId(doc.getObjectId("_id").toHexString());
+        msg.setChatId(doc.getString("chatId"));
+        msg.setSenderLogin(doc.getString("senderLogin"));
+        msg.setEncryptedContent(doc.getString("encryptedContent"));
+        Long btime = doc.getLong("sentAt");
+        if (btime != null) {
+            msg.setSentAt(Instant.ofEpochMilli(btime));
+        } else msg.setSentAt(Instant.now());
+        return msg;
     }
 
     private Message docToMessage(Document doc) {

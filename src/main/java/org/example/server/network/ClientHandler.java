@@ -283,53 +283,88 @@ public class ClientHandler implements Runnable {
 
     private void handleAdminAction(Packet packet) throws Exception {
         requireAuth();
-
-        User actor = userRepo.findByLogin(authenticatedLogin);
-        if (actor == null || actor.getRole() != User.Role.ADMIN) {
-            sendError("Access denied: admin only");
-            return;
-        }
-
         Map<String, String> data = PayloadBuilder.parse(packet.getPayload());
-        String action   = data.get("action");
-        String target   = data.get("target");
+        String action    = data.get("action");
+        String target    = data.get("target");
         String messageId = data.get("messageId");
 
-        switch (action) {
-            case "BAN_USER" -> {
-                userRepo.setStatus(target, User.Status.BANNED);
-                ClientHandler targetHandler = registry.getHandler(target);
-                if (targetHandler != null) {
-                    targetHandler.sendPacket(new Packet(PacketType.LOGIN_FAIL,
-                            new PayloadBuilder().add("reason", "Your account has been banned").build()));
-                    targetHandler.disconnect();
+        boolean isOwnerAction = "DELETE_MESSAGE".equals(action) || "EDIT_MESSAGE".equals(action);
+
+        if (isOwnerAction) {
+            if (messageId == null || messageId.isEmpty()) {
+                sendError("Missing messageId");
+                return;
+            }
+            Message originalMsg = messageRepo.findById(messageId);
+            if (originalMsg == null) {
+                sendError("Message not found");
+                return;
+            }
+
+            User actor = userRepo.findByLogin(authenticatedLogin);
+            boolean isAdmin = (actor != null && actor.getRole() == User.Role.ADMIN);
+            boolean isAuthor = originalMsg.getSenderLogin().equals(authenticatedLogin);
+
+            if (!isAdmin && !isAuthor) {
+                sendError("Access denied: You are not the author of this message");
+                return;
+            }
+
+            switch (action) {
+                case "DELETE_MESSAGE" -> {
+                    messageRepo.markDeleted(messageId);
+
+                    Packet refreshPacket = new Packet(PacketType.ADMIN_ACTION_RESULT,
+                            new PayloadBuilder()
+                                    .add("result", "REFRESH_HISTORY")
+                                    .add("chatId", originalMsg.getChatId())
+                                    .build());
+                    registry.broadcast(refreshPacket, null);
                 }
-                sendPacket(new Packet(PacketType.ADMIN_ACTION_RESULT,
-                        new PayloadBuilder().add("result", "User " + target + " banned").build()));
-            }
-            case "DELETE_USER" -> {
-                ClientHandler targetHandler = registry.getHandler(target);
-                if (targetHandler != null) {
-                    targetHandler.disconnect();
+                case "EDIT_MESSAGE" -> {
+                    if (target == null || target.isBlank()) {
+                        sendError("Content cannot be empty");
+                        return;
+                    }
+                    messageRepo.updateMessageText(messageId, target);
+
+                    Packet refreshPacket = new Packet(PacketType.ADMIN_ACTION_RESULT,
+                            new PayloadBuilder()
+                                    .add("result", "REFRESH_HISTORY")
+                                    .add("chatId", originalMsg.getChatId())
+                                    .build());
+                    registry.broadcast(refreshPacket, null);
                 }
-                userRepo.delete(target);
-                sendPacket(new Packet(PacketType.ADMIN_ACTION_RESULT,
-                        new PayloadBuilder().add("result", "User " + target + " deleted").build()));
             }
-            case "DELETE_MESSAGE" -> {
-                messageRepo.markDeleted(messageId);
-                sendPacket(new Packet(PacketType.ADMIN_ACTION_RESULT,
-                        new PayloadBuilder().add("result", "Message deleted").build()));
+        } else {
+            User actor = userRepo.findByLogin(authenticatedLogin);
+            if (actor == null || actor.getRole() != User.Role.ADMIN) {
+                sendError("Access denied: admin only");
+                return;
             }
-            case "SERVER_STATS" -> {
-                int activeConnections = registry.getActiveCount();
-                sendPacket(new Packet(PacketType.ADMIN_ACTION_RESULT,
-                        new PayloadBuilder()
-                                .add("result", "stats")
-                                .add("connections", String.valueOf(activeConnections))
-                                .build()));
+
+            switch (action) {
+                case "BAN_USER" -> {
+                    userRepo.setStatus(target, User.Status.BANNED);
+                    ClientHandler targetHandler = registry.getHandler(target);
+                    if (targetHandler != null) {
+                        targetHandler.sendPacket(new Packet(PacketType.LOGIN_FAIL,
+                                new PayloadBuilder().add("reason", "Your account has been banned").build()));
+                        targetHandler.disconnect();
+                    }
+                    sendPacket(new Packet(PacketType.ADMIN_ACTION_RESULT,
+                            new PayloadBuilder().add("result", "User " + target + " banned").build()));
+                }
+                case "SERVER_STATS" -> {
+                    int activeConnections = registry.getActiveCount();
+                    sendPacket(new Packet(PacketType.ADMIN_ACTION_RESULT,
+                            new PayloadBuilder()
+                                    .add("result", "stats")
+                                    .add("connections", String.valueOf(activeConnections))
+                                    .build()));
+                }
+                default -> sendError("Unknown admin action: " + action);
             }
-            default -> sendError("Unknown admin action: " + action);
         }
     }
 

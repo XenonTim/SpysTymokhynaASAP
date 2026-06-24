@@ -37,6 +37,6 @@ public class User {
     public Status getStatus() { return status; }
     public void setStatus(Status status) { this.status = status; }
 
-    public boolean isOnline() { return online; }
+    public boolean getIsOnline() { return online; }
     public void setOnline(boolean online) { this.online = online; }
 }
